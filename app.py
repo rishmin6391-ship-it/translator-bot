@@ -1,19 +1,18 @@
 import os
 import re
+import sys
+import traceback
 from typing import List
 from dotenv import load_dotenv
 from flask import Flask, request, abort
 
-import sys
-import traceback
-
 from linebot import LineBotApi, WebhookHandler
 from linebot.exceptions import InvalidSignatureError
-from linebot.models import MessageEvent, TextMessage, TextSendMessage
+from linebot.models import MessageEvent, TextMessage, TextSendMessage, JoinEvent
 
 from openai import OpenAI
 
-# Load .env if present (Render will use Environment Variables UI)
+# Load .env if present (Render uses Environment Variables UI in production)
 load_dotenv()
 
 # --- LINE setup ---
@@ -22,7 +21,7 @@ LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET")
 if not LINE_CHANNEL_ACCESS_TOKEN or not LINE_CHANNEL_SECRET:
     raise RuntimeError("Missing LINE credentials. Set LINE_CHANNEL_ACCESS_TOKEN and LINE_CHANNEL_SECRET.")
 
-line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
+line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)  # v2 API (works; deprecation warning is OK for now)
 handler = WebhookHandler(LINE_CHANNEL_SECRET)
 
 # --- OpenAI setup ---
@@ -30,12 +29,11 @@ OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 if not OPENAI_API_KEY:
     raise RuntimeError("Missing OPENAI_API_KEY.")
-
 client = OpenAI(api_key=OPENAI_API_KEY)
 
-# --- Language script detectors ---
-HANGUL_RE = re.compile(r"[\u3131-\uD79D]+")      # Korean script
-THAI_RE = re.compile(r"[\u0E00-\u0E7F]+")        # Thai script
+# --- Script detectors ---
+HANGUL_RE = re.compile(r"[\u3131-\uD79D]+")   # Korean script
+THAI_RE   = re.compile(r"[\u0E00-\u0E7F]+")   # Thai script
 
 app = Flask(__name__)
 
@@ -62,6 +60,7 @@ SYSTEM_PROMPT = (
 def translate_ko_th(text: str) -> str:
     target = decide_target_lang(text)
     hint = f"Target language: {target}."
+    print("[TRANSLATE] target:", target, file=sys.stderr)
     resp = client.chat.completions.create(
         model=OPENAI_MODEL,
         messages=[
@@ -73,10 +72,9 @@ def translate_ko_th(text: str) -> str:
     return resp.choices[0].message.content.strip()
 
 def chunk_text(s: str, limit: int = 4500) -> List[str]:
-    """Split long messages to avoid size limits."""
     return [s[i:i+limit] for i in range(0, len(s), limit)]
 
-@app.route("/", methods=["GET"])
+@app.route("/", methods=["GET", "HEAD"])
 def health():
     return "OK", 200
 
@@ -91,20 +89,26 @@ def callback():
         abort(400, "Invalid signature")
     return "OK"
 
+@handler.add(JoinEvent)
+def handle_join(event: JoinEvent):
+    try:
+        line_bot_api.reply_message(
+            event.reply_token,
+            TextSendMessage(text="안녕하세요! 한국어↔태국어 자동 번역 봇이에요. 편하게 말해 보세요 😊")
+        )
+    except Exception as e:
+        print("[JOIN ERROR]", type(e).__name__, str(e), file=sys.stderr)
+        traceback.print_exc()
+
 @handler.add(MessageEvent, message=TextMessage)
 def handle_text(event: MessageEvent):
     user_text = event.message.text.strip()
 
-    # Optional command overrides:
-    # /ko -> force THAI->KOREAN
-    # /th -> force KOREAN->THAI
     forced = None
     if user_text.startswith("/ko "):
-        forced = "KOREAN"
-        user_text = user_text[4:]
+        forced = "KOREAN"; user_text = user_text[4:]
     elif user_text.startswith("/th "):
-        forced = "THAI"
-        user_text = user_text[4:]
+        forced = "THAI"; user_text = user_text[4:]
 
     try:
         if forced:
@@ -122,17 +126,18 @@ def handle_text(event: MessageEvent):
             translated = translate_ko_th(user_text)
 
     except Exception as e:
-    # ✅ 에러 유형/메시지 로그로 남기기
-    print("[OpenAI ERROR]", type(e).__name__, str(e), file=sys.stderr)
-    # ✅ 스택 트레이스(어디서 터졌는지)까지 남기기
-    traceback.print_exc()
-    translated = "번역 중 문제가 발생했어요. 잠시 후 다시 시도해 주세요."
+        print("[OpenAI ERROR]", type(e).__name__, str(e), file=sys.stderr)
+        traceback.print_exc()
+        translated = "번역 중 문제가 발생했어요. 잠시 후 다시 시도해 주세요."
 
     parts = chunk_text(translated)
     messages = [TextSendMessage(text=p) for p in parts]
-    line_bot_api.reply_message(event.reply_token, messages)
+    try:
+        line_bot_api.reply_message(event.reply_token, messages)
+    except Exception as e:
+        print("[LINE REPLY ERROR]", type(e).__name__, str(e), file=sys.stderr)
+        traceback.print_exc()
 
 if __name__ == "__main__":
-    # Render sets PORT env var automatically
     port = int(os.environ.get("PORT", 3000))
     app.run(host="0.0.0.0", port=port)

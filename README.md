@@ -1,1 +1,1 @@
-# See README in previous package; steps unchanged.
+# Translator bot with logging
