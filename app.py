@@ -21,7 +21,8 @@ LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET")
 if not LINE_CHANNEL_ACCESS_TOKEN or not LINE_CHANNEL_SECRET:
     raise RuntimeError("Missing LINE credentials. Set LINE_CHANNEL_ACCESS_TOKEN and LINE_CHANNEL_SECRET.")
 
-line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)  # v2 API (works; deprecation warning is OK for now)
+# v2 API (works; deprecation warning is OK for now)
+line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(LINE_CHANNEL_SECRET)
 
 # --- OpenAI setup ---
@@ -104,11 +105,17 @@ def handle_join(event: JoinEvent):
 def handle_text(event: MessageEvent):
     user_text = event.message.text.strip()
 
+    # (Optional) input logging for debugging
+    # print("[DEBUG] user_text:", repr(user_text), file=sys.stderr)
+
+    # Optional command overrides
     forced = None
     if user_text.startswith("/ko "):
-        forced = "KOREAN"; user_text = user_text[4:]
+        forced = "KOREAN"
+        user_text = user_text[4:]
     elif user_text.startswith("/th "):
-        forced = "THAI"; user_text = user_text[4:]
+        forced = "THAI"
+        user_text = user_text[4:]
 
     try:
         if forced:
@@ -126,6 +133,7 @@ def handle_text(event: MessageEvent):
             translated = translate_ko_th(user_text)
 
     except Exception as e:
+        # ✅ Detailed error logs to Render
         print("[OpenAI ERROR]", type(e).__name__, str(e), file=sys.stderr)
         traceback.print_exc()
         translated = "번역 중 문제가 발생했어요. 잠시 후 다시 시도해 주세요."
