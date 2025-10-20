@@ -1,4 +1,3 @@
-python
 import os
 import re
 from typing import List
@@ -32,8 +31,8 @@ if not OPENAI_API_KEY:
 client = OpenAI(api_key=OPENAI_API_KEY)
 
 # --- Language script detectors ---
-HANGUL_RE = re.compile(r"[\\u3131-\\uD79D]+")      # Korean script
-THAI_RE = re.compile(r"[\\u0E00-\\u0E7F]+")        # Thai script
+HANGUL_RE = re.compile(r"[\u3131-\uD79D]+")      # Korean script
+THAI_RE = re.compile(r"[\u0E00-\u0E7F]+")        # Thai script
 
 app = Flask(__name__)
 
@@ -48,12 +47,12 @@ def decide_target_lang(text: str) -> str:
     return "KOREAN"
 
 SYSTEM_PROMPT = (
-    "You are a precise, friendly translator for casual LINE chats between Korean and Thai speakers.\\n"
-    "- Detect the source language.\\n"
-    "- If the message contains Korean, translate it into NATURAL THAI suitable for friendly chat (no stiff business tone).\\n"
-    "- If the message contains Thai, translate it into NATURAL KOREAN in a friendly, casual tone (banmal; not overly formal).\\n"
-    "- If neither script is clearly present, choose the opposite among Korean/Thai based on context, default to Korean.\\n"
-    "- Preserve emojis, names, and intent; adapt idioms to sound native.\\n"
+    "You are a precise, friendly translator for casual LINE chats between Korean and Thai speakers.\n"
+    "- Detect the source language.\n"
+    "- If the message contains Korean, translate it into NATURAL THAI suitable for friendly chat (no stiff business tone).\n"
+    "- If the message contains Thai, translate it into NATURAL KOREAN in a friendly, casual tone (banmal; not overly formal).\n"
+    "- If neither script is clearly present, choose the opposite among Korean/Thai based on context, default to Korean.\n"
+    "- Preserve emojis, names, and intent; adapt idioms to sound native.\n"
     "- Return ONLY the translation text. Do NOT add quotes, language tags, or explanations."
 )
 
@@ -64,7 +63,7 @@ def translate_ko_th(text: str) -> str:
         model=OPENAI_MODEL,
         messages=[
             {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": f"{hint}\\n{text}"},
+            {"role": "user", "content": f"{hint}\n{text}"},
         ],
         temperature=0.2,
     )
@@ -119,7 +118,7 @@ def handle_text(event: MessageEvent):
         else:
             translated = translate_ko_th(user_text)
 
-    except Exception as e:
+    except Exception:
         translated = "번역 중 문제가 발생했어요. 잠시 후 다시 시도해 주세요."
 
     parts = chunk_text(translated)
