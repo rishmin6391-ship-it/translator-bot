@@ -121,8 +121,12 @@ def handle_text(event: MessageEvent):
         else:
             translated = translate_ko_th(user_text)
 
-    except Exception:
-        translated = "번역 중 문제가 발생했어요. 잠시 후 다시 시도해 주세요."
+    except Exception as e:
+    # ✅ 에러 유형/메시지 로그로 남기기
+    print("[OpenAI ERROR]", type(e).__name__, str(e), file=sys.stderr)
+    # ✅ 스택 트레이스(어디서 터졌는지)까지 남기기
+    traceback.print_exc()
+    translated = "번역 중 문제가 발생했어요. 잠시 후 다시 시도해 주세요."
 
     parts = chunk_text(translated)
     messages = [TextSendMessage(text=p) for p in parts]
