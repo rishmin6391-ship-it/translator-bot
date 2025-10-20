@@ -4,6 +4,9 @@ from typing import List
 from dotenv import load_dotenv
 from flask import Flask, request, abort
 
+import sys
+import traceback
+
 from linebot import LineBotApi, WebhookHandler
 from linebot.exceptions import InvalidSignatureError
 from linebot.models import MessageEvent, TextMessage, TextSendMessage
