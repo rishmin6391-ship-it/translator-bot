@@ -1,0 +1,16 @@
+# app.py (excerpt with critical fix)
+from linebot.http_client import RequestsHttpClient
+from linebot import LineBotApi
+
+HTTP_TIMEOUT = (15, 60)
+
+# ❌ (이전) 인스턴스를 만들어 넣으면 __init__에서 'callable'로 취급되어 에러
+# http_client = RequestsHttpClient(timeout=HTTP_TIMEOUT)
+# line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN, http_client=http_client)
+
+# ✅ (수정) CLASS를 넣고 timeout은 LineBotApi의 인자로 전달
+line_bot_api = LineBotApi(
+    LINE_CHANNEL_ACCESS_TOKEN,
+    http_client=RequestsHttpClient,   # class
+    timeout=HTTP_TIMEOUT,             # (connect, read)
+)
