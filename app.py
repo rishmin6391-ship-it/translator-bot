@@ -1,36 +1,39 @@
-import os  # L002
-import re  # L003
-import sys  # L004
-import traceback  # L005
-from typing import List  # L006
-from dotenv import load_dotenv  # L007
-from flask import Flask, request, abort  # L008
-from linebot import LineBotApi, WebhookHandler  # L010
-from linebot.exceptions import InvalidSignatureError  # L011
-from linebot.models import MessageEvent, TextMessage, TextSendMessage, JoinEvent  # L012
-from openai import OpenAI  # L014
-load_dotenv()  # L017
-LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN")  # L020
-LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET")  # L021
-if not LINE_CHANNEL_ACCESS_TOKEN or not LINE_CHANNEL_SECRET:  # L022
-    raise RuntimeError("Missing LINE credentials. Set LINE_CHANNEL_ACCESS_TOKEN and LINE_CHANNEL_SECRET.")  # L023
-line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)  # L026
-handler = WebhookHandler(LINE_CHANNEL_SECRET)  # L027
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")  # L030
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")  # L031
-if not OPENAI_API_KEY:  # L032
-    raise RuntimeError("Missing OPENAI_API_KEY.")  # L033
-client = OpenAI(api_key=OPENAI_API_KEY)  # L034
-HANGUL_RE = re.compile(r"[\u3131-\uD79D]+")  # L037
-THAI_RE   = re.compile(r"[\u0E00-\u0E7F]+")  # L038
-app = Flask(__name__)  # L040
+import os
+import re
+import sys
+import traceback
+from typing import List
+from dotenv import load_dotenv
+from flask import Flask, request, abort
+from linebot import LineBotApi, WebhookHandler
+from linebot.exceptions import InvalidSignatureError
+from linebot.models import MessageEvent, TextMessage, TextSendMessage, JoinEvent
+from openai import OpenAI
 
-def decide_target_lang(text: str) -> str:  # L042
-    has_ko = bool(HANGUL_RE.search(text))  # L044
-    has_th = bool(THAI_RE.search(text))  # L045
-    if has_ko and not has_th: return "THAI"  # L046
-    if has_th and not has_ko: return "KOREAN"  # L048
-    return "KOREAN"  # L050
+load_dotenv()
+LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN")
+LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET")
+if not LINE_CHANNEL_ACCESS_TOKEN or not LINE_CHANNEL_SECRET:
+    raise RuntimeError("Missing LINE credentials. Set LINE_CHANNEL_ACCESS_TOKEN and LINE_CHANNEL_SECRET.")
+line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
+handler = WebhookHandler(LINE_CHANNEL_SECRET)
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+if not OPENAI_API_KEY:
+    raise RuntimeError("Missing OPENAI_API_KEY.")
+client = OpenAI(api_key=OPENAI_API_KEY)
+HANGUL_RE = re.compile(r"[\u3131-\uD79D]+")
+THAI_RE   = re.compile(r"[\u0E00-\u0E7F]+")
+app = Flask(__name__)
+
+def decide_target_lang(text: str) -> str:
+    has_ko = bool(HANGUL_RE.search(text))
+    has_th = bool(THAI_RE.search(text))
+    if has_ko and not has_th:
+        return "THAI"
+    if has_th and not has_ko:
+        return "KOREAN"
+    return "KOREAN"
 
 SYSTEM_PROMPT = (
     "You are a precise, friendly translator for casual LINE chats between Korean and Thai speakers.\n"
@@ -41,10 +44,10 @@ SYSTEM_PROMPT = (
     "- Return ONLY the translation text."
 )
 
-def translate_ko_th(text: str) -> str:  # L062
-    target = decide_target_lang(text)  # L063
-    hint = f"Target language: {target}."  # L064
-    print("[TRANSLATE] target:", target, file=sys.stderr)  # L065
+def translate_ko_th(text: str) -> str:
+    target = decide_target_lang(text)
+    hint = f"Target language: {target}."
+    print("[TRANSLATE] target:", target, file=sys.stderr)
     resp = client.chat.completions.create(
         model=OPENAI_MODEL,
         messages=[
@@ -53,7 +56,7 @@ def translate_ko_th(text: str) -> str:  # L062
         ],
         temperature=0.2,
     )
-    return resp.choices[0].message.content.strip()  # L074
+    return resp.choices[0].message.content.strip()
 
 def chunk_text(s: str, limit: int = 4500) -> List[str]:
     return [s[i:i+limit] for i in range(0, len(s), limit)]
@@ -88,9 +91,11 @@ def handle_text(event: MessageEvent):
     user_text = event.message.text.strip()
     forced = None
     if user_text.startswith("/ko "):
-        forced = "KOREAN"; user_text = user_text[4:]
+        forced = "KOREAN"
+        user_text = user_text[4:]
     elif user_text.startswith("/th "):
-        forced = "THAI"; user_text = user_text[4:]
+        forced = "THAI"
+        user_text = user_text[4:]
     try:
         if forced:
             forced_prompt = SYSTEM_PROMPT + f" Translate STRICTLY into {forced}."
