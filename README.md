@@ -1,15 +1,9 @@
-# Translator Bot (Final Stable Version)
-LINE 메시지를 자동 번역하는 봇입니다.
+# Translator Bot — Production (gunicorn)
+- Flask dev server 경고 제거 (gunicorn 사용)
+- Python 3.11.9 고정
+- LINE SDK v2 + OpenAI
 
-## 구성
-- Python 3.11.9
-- Flask 서버
-- LINE Messaging API
-- OpenAI API (gpt-4o-mini)
-
-## Render 배포
-1. GitHub 업로드
-2. Render에서 새 Web Service 생성
-3. 환경 변수 설정
-4. Manual Deploy → Deploy latest commit
-5. Verify Webhook → 대화 테스트
+## Render
+Build: pip install -r requirements.txt
+Start: (Procfile 자동 인식) 또는 `gunicorn app:app --workers 2 --threads 4 --timeout 60`
+Webhook: https://<service>.onrender.com/callback
