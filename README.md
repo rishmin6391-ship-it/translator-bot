@@ -1,13 +1,15 @@
-# Translator Bot — Patch (v2.4.3 & Python 3.11)
+# 완전정리판 — LINE Thai ↔ Korean Translator
 
-## What's changed
-- line-bot-sdk==2.4.3 (존재하는 v2 최신)
-- python-3.11.9 고정 (runtime.txt, .python-version 포함)
-- Reply API 타임아웃 튜플(10,30) + 재시도(10,45)
+## 포함
+- Python 3.11.9 고정 (`runtime.txt`, `.python-version`)
+- `line-bot-sdk==2.4.3` (v2 API)
+- 타임아웃 (10,30) + 재시도 (10,45)
+- Flask webhook: `/callback` GET/POST
 
-## Deploy
-1) 이 파일들을 **리포지토리 루트**에 업로드/커밋
-2) Render → Settings → Advanced → **Clear build cache**
-3) 상단 **Manual Deploy → Deploy latest commit**
-4) Build Log에서 Python 3.11.9 적용 확인
-5) 브라우저로 / 열어 OK 확인 → LINE Webhook Verify
+## 배포
+1) 이 파일들을 **리포 루트**에 업로드/커밋 (pyproject/poetry.lock 제거)
+2) Render → New → Web Service (Root Directory 확인)
+   - Build: `pip install --upgrade pip wheel setuptools && pip install --no-cache-dir -r requirements.txt`
+   - Start: `python app.py`
+3) `/` 접속 시 `OK` + Logs에 `[BOOT] Python: 3.11.9` 확인
+4) Webhook: `https://<service>.onrender.com/callback` → Verify
