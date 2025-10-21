@@ -65,8 +65,13 @@ def chunk_text(s: str, limit: int = 4500) -> List[str]:
 def health():
     return "OK", 200
 
-@app.route("/callback", methods=["POST"])
+@app.route("/callback", methods=["GET", "POST"])
 def callback():
+    if request.method == "GET":
+        # LINE 콘솔 Verify나 외부 헬스체크가 GET으로 올 때 200 응답
+        return "OK", 200
+
+    # POST는 기존대로 서명 검증 + 핸들러 처리
     signature = request.headers.get("X-Line-Signature", "")
     body = request.get_data(as_text=True)
     try:
