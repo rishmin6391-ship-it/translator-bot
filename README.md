@@ -1,15 +1,15 @@
-# 완전정리판 — LINE Thai ↔ Korean Translator
+# Translator Bot (Final Stable Version)
+LINE 메시지를 자동 번역하는 봇입니다.
 
-## 포함
-- Python 3.11.9 고정 (`runtime.txt`, `.python-version`)
-- `line-bot-sdk==2.4.3` (v2 API)
-- 타임아웃 (10,30) + 재시도 (10,45)
-- Flask webhook: `/callback` GET/POST
+## 구성
+- Python 3.11.9
+- Flask 서버
+- LINE Messaging API
+- OpenAI API (gpt-4o-mini)
 
-## 배포
-1) 이 파일들을 **리포 루트**에 업로드/커밋 (pyproject/poetry.lock 제거)
-2) Render → New → Web Service (Root Directory 확인)
-   - Build: `pip install --upgrade pip wheel setuptools && pip install --no-cache-dir -r requirements.txt`
-   - Start: `python app.py`
-3) `/` 접속 시 `OK` + Logs에 `[BOOT] Python: 3.11.9` 확인
-4) Webhook: `https://<service>.onrender.com/callback` → Verify
+## Render 배포
+1. GitHub 업로드
+2. Render에서 새 Web Service 생성
+3. 환경 변수 설정
+4. Manual Deploy → Deploy latest commit
+5. Verify Webhook → 대화 테스트
