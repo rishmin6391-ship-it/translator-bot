@@ -1,18 +1,13 @@
-# LINE Thai ↔ Korean Translator Bot — Timeout Applied Package
+# Translator Bot — Patch (v2.4.3 & Python 3.11)
 
-This package includes longer timeouts and retry for LINE Reply API, plus Python 3.11.9 runtime.
+## What's changed
+- line-bot-sdk==2.4.3 (존재하는 v2 최신)
+- python-3.11.9 고정 (runtime.txt, .python-version 포함)
+- Reply API 타임아웃 튜플(10,30) + 재시도(10,45)
 
 ## Deploy
-1) Upload to GitHub (repo root).
-2) Render → New Web Service → connect this repo.
-3) Build Command:
-   pip install --upgrade pip wheel setuptools && pip install -r requirements.txt
-4) Start Command:
-   python app.py
-5) Env vars: OPENAI_API_KEY, LINE_CHANNEL_ACCESS_TOKEN, LINE_CHANNEL_SECRET, (optional) OPENAI_MODEL
-6) Open https://<service>.onrender.com/ → should show 'OK'.
-7) Webhook URL: https://<service>.onrender.com/callback → Use webhook ON → Verify.
-
-## Notes
-- /callback supports GET 200 (for Verify) and POST (for real events).
-- Reply API timeout: 15s + retry 25s if ReadTimeout.
+1) 이 파일들을 **리포지토리 루트**에 업로드/커밋
+2) Render → Settings → Advanced → **Clear build cache**
+3) 상단 **Manual Deploy → Deploy latest commit**
+4) Build Log에서 Python 3.11.9 적용 확인
+5) 브라우저로 / 열어 OK 확인 → LINE Webhook Verify

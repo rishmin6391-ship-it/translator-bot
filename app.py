@@ -3,20 +3,19 @@ import re
 import sys
 import traceback
 from typing import List
+
 from dotenv import load_dotenv
 from flask import Flask, request, abort
 
 from linebot import LineBotApi, WebhookHandler
 from linebot.exceptions import InvalidSignatureError
 from linebot.models import MessageEvent, TextMessage, TextSendMessage, JoinEvent
-from linebot.http_client import RequestsHttpClient
-HTTP_TIMEOUT = (10, 30)
-http_client = RequestsHttpClient(timeout=HTTP_TIMEOUT)
-line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN, http_client=http_client)
+from linebot.http_client import RequestsHttpClient  # v2 SDK
+from requests.exceptions import ReadTimeout
 
 from openai import OpenAI
 
-# Load .env if running locally; on Render, set Environment variables
+# Load .env if local
 load_dotenv()
 
 # --- LINE setup ---
@@ -25,9 +24,10 @@ LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET")
 if not LINE_CHANNEL_ACCESS_TOKEN or not LINE_CHANNEL_SECRET:
     raise RuntimeError("Missing LINE credentials. Set LINE_CHANNEL_ACCESS_TOKEN and LINE_CHANNEL_SECRET.")
 
-# Use custom http_client to increase timeout (default ~5s)
-http_client = RequestsHttpClient(timeout=15)
-line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN, http_client=http_client)  # v2 API (deprecation warning is OK)
+# Separate (connect, read) timeouts
+HTTP_TIMEOUT = (10, 30)
+http_client = RequestsHttpClient(timeout=HTTP_TIMEOUT)
+line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN, http_client=http_client)  # v2 API
 handler = WebhookHandler(LINE_CHANNEL_SECRET)
 
 # --- OpenAI setup ---
@@ -44,7 +44,6 @@ THAI_RE   = re.compile(r"[\u0E00-\u0E7F]+")   # Thai script
 app = Flask(__name__)
 
 def decide_target_lang(text: str) -> str:
-    """Return 'THAI' if source contains Korean only; 'KOREAN' if Thai only; default 'KOREAN'."""
     has_ko = bool(HANGUL_RE.search(text))
     has_th = bool(THAI_RE.search(text))
     if has_ko and not has_th:
@@ -67,7 +66,14 @@ def translate_ko_th(text: str) -> str:
     target = decide_target_lang(text)
     hint = f"Target language: {target}."
     print("[TRANSLATE] target:", target, file=sys.stderr)
-    resp = client.chat.completions.create(
+    resp = client.chat_completions.create(  # fallback if OpenAI lib < 1.2 style is required
+        model=OPENAI_MODEL,
+        messages=[
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": f"{hint}\n{text}"},
+        ],
+        temperature=0.2,
+    ) if hasattr(client, "chat_completions") else client.chat.completions.create(
         model=OPENAI_MODEL,
         messages=[
             {"role": "system", "content": SYSTEM_PROMPT},
@@ -75,16 +81,19 @@ def translate_ko_th(text: str) -> str:
         ],
         temperature=0.2,
     )
-    return resp.choices[0].message.content.strip()
+    # normalize
+    content = resp.choices[0].message["content"] if isinstance(resp.choices[0].message, dict) else resp.choices[0].message.content
+    return content.strip()
 
 def chunk_text(s: str, limit: int = 4500) -> List[str]:
     return [s[i:i+limit] for i in range(0, len(s), limit)]
 
 @app.route("/", methods=["GET", "HEAD"])
 def health():
+    print("[BOOT] Python:", sys.version, file=sys.stderr)
+    print("[BOOT] HTTP_TIMEOUT:", HTTP_TIMEOUT, file=sys.stderr)
     return "OK", 200
 
-# Accept GET for Verify (200) and POST for real webhooks
 @app.route("/callback", methods=["GET", "POST"])
 def callback():
     if request.method == "GET":
@@ -96,6 +105,9 @@ def callback():
         handler.handle(body, signature)
     except InvalidSignatureError:
         abort(400, "Invalid signature")
+    except Exception as e:
+        print("[WEBHOOK ERROR]", type(e).__name__, str(e), file=sys.stderr)
+        traceback.print_exc()
     return "OK"
 
 @handler.add(JoinEvent)
@@ -113,7 +125,6 @@ def handle_join(event: JoinEvent):
 def handle_text(event: MessageEvent):
     user_text = event.message.text.strip()
 
-    # Optional command overrides
     forced = None
     if user_text.startswith("/ko "):
         forced = "KOREAN"
@@ -125,7 +136,14 @@ def handle_text(event: MessageEvent):
     try:
         if forced:
             forced_prompt = SYSTEM_PROMPT + f" Translate STRICTLY into {forced}."
-            resp = client.chat.completions.create(
+            resp = client.chat_completions.create(
+                model=OPENAI_MODEL,
+                messages=[
+                    {"role": "system", "content": forced_prompt},
+                    {"role": "user", "content": user_text},
+                ],
+                temperature=0.2,
+            ) if hasattr(client, "chat_completions") else client.chat.completions.create(
                 model=OPENAI_MODEL,
                 messages=[
                     {"role": "system", "content": forced_prompt},
@@ -133,7 +151,8 @@ def handle_text(event: MessageEvent):
                 ],
                 temperature=0.2,
             )
-            translated = resp.choices[0].message.content.strip()
+            content = resp.choices[0].message["content"] if isinstance(resp.choices[0].message, dict) else resp.choices[0].message.content
+            translated = content.strip()
         else:
             translated = translate_ko_th(user_text)
     except Exception as e:
@@ -144,13 +163,11 @@ def handle_text(event: MessageEvent):
     parts = chunk_text(translated)
     messages = [TextSendMessage(text=p) for p in parts]
     try:
-        # First try with 15s timeout
-        line_bot_api.reply_message(event.reply_token, messages, timeout=15)
+        line_bot_api.reply_message(event.reply_token, messages, timeout=HTTP_TIMEOUT)
     except ReadTimeout:
-        print("[LINE REPLY TIMEOUT] retry with 25s", file=sys.stderr)
+        print("[LINE REPLY TIMEOUT] retry with (10, 45)", file=sys.stderr)
         try:
-            # Second attempt within replyToken validity
-            line_bot_api.reply_message(event.reply_token, messages, timeout=25)
+            line_bot_api.reply_message(event.reply_token, messages, timeout=(10, 45))
         except Exception as e2:
             print("[LINE REPLY ERROR/RETRY]", type(e2).__name__, str(e2), file=sys.stderr)
             traceback.print_exc()
