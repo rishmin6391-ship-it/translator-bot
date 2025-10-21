@@ -1,4 +1,5 @@
-flask
-python-dotenv
-line-bot-sdk==2.*
-openai
+flask==3.0.3
+python-dotenv==1.0.1
+line-bot-sdk==2.5.0
+openai>=1.51.0,<2
+httpx>=0.27
