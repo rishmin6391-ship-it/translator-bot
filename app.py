@@ -9,8 +9,10 @@ from flask import Flask, request, abort
 from linebot import LineBotApi, WebhookHandler
 from linebot.exceptions import InvalidSignatureError
 from linebot.models import MessageEvent, TextMessage, TextSendMessage, JoinEvent
-from linebot.http_client import RequestsHttpClient  # timeout control
-from requests.exceptions import ReadTimeout           # retry on timeout
+from linebot.http_client import RequestsHttpClient
+HTTP_TIMEOUT = (10, 30)
+http_client = RequestsHttpClient(timeout=HTTP_TIMEOUT)
+line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN, http_client=http_client)
 
 from openai import OpenAI
 
