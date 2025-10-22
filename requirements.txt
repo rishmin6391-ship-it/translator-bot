@@ -1,7 +1,7 @@
 flask==3.0.3
 python-dotenv==1.0.1
-line-bot-sdk==2.4.3
-openai<2,>=1.51.0
+line-bot-sdk==3.19.1
+openai==1.109.1
 httpx==0.27.2
 gunicorn==21.2.0
 line-bot-sdk==3.19.1
