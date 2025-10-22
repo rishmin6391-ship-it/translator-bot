@@ -1,179 +1,131 @@
-# app.py
-import os
-import re
-import logging
-from flask import Flask, request
-
+# app.py (v3 SDK 완성본)
+import os, sys, json
+from flask import Flask, request, abort
 from dotenv import load_dotenv
-load_dotenv()  # Render 환경변수도 우선, 로컬 개발 시 .env 사용
 
-# ===== LINE v3 SDK =====
+# ── LINE v3 SDK ─────────────────────────────────────────────
 from linebot.v3.webhook import WebhookHandler
 from linebot.v3.exceptions import InvalidSignatureError
-from linebot.v3.webhooks import (
-    MessageEvent,
-    TextMessageContent,
-    JoinEvent,
-    FollowEvent,
-)
 from linebot.v3.messaging import (
-    Configuration,
-    ApiClient,
-    MessagingApi,
-    ReplyMessageRequest,
-    TextMessage,
+    Configuration, ApiClient, MessagingApi,
+    ReplyMessageRequest, TextMessage
 )
 
-# ===== OpenAI SDK =====
+# ── OpenAI ─────────────────────────────────────────────────
 from openai import OpenAI
 
-# ===== 기본 설정 =====
-app = Flask(__name__)
-app.logger.setLevel(logging.INFO)
+# 환경변수(.env는 로컬에서만; Render는 대시보드에 변수로 입력)
+load_dotenv()
 
-LINE_CHANNEL_SECRET = os.environ.get("LINE_CHANNEL_SECRET", "")
-LINE_CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN", "")
-OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
-OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
+LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN")
+LINE_CHANNEL_SECRET       = os.getenv("LINE_CHANNEL_SECRET")
+OPENAI_API_KEY            = os.getenv("OPENAI_API_KEY")
+OPENAI_MODEL              = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 
-if not LINE_CHANNEL_SECRET or not LINE_CHANNEL_ACCESS_TOKEN:
-    app.logger.warning("[WARN] LINE 채널 키가 비어 있습니다.")
-if not OPENAI_API_KEY:
-    app.logger.warning("[WARN] OPENAI_API_KEY가 비어 있습니다.")
+if not (LINE_CHANNEL_ACCESS_TOKEN and LINE_CHANNEL_SECRET and OPENAI_API_KEY):
+    print("[ENV ERROR] 환경변수 누락 확인:", {
+        "LINE_CHANNEL_ACCESS_TOKEN": bool(LINE_CHANNEL_ACCESS_TOKEN),
+        "LINE_CHANNEL_SECRET": bool(LINE_CHANNEL_SECRET),
+        "OPENAI_API_KEY": bool(OPENAI_API_KEY),
+    }, file=sys.stderr)
 
-# LINE v3: 핸들러/클라이언트
+# LINE v3 객체 준비
 handler = WebhookHandler(LINE_CHANNEL_SECRET)
 line_config = Configuration(access_token=LINE_CHANNEL_ACCESS_TOKEN)
-# 타임아웃은 gunicorn과 네트워크에서 보장, 필요 시 urllib3.Timeout 연결 가능
 
 # OpenAI 클라이언트
-oai = OpenAI(api_key=OPENAI_API_KEY)
+client = OpenAI(api_key=OPENAI_API_KEY)
 
-# ===== 유틸: 한/태 간단 감지 =====
-# (정교한 감지는 모델에 맡기되, 안내 메시지/포맷용으로 간단 사용)
-_RE_THAI = re.compile(r"[\u0E00-\u0E7F]")   # 태국어 범위
-_RE_KOREAN = re.compile(r"[\uAC00-\uD7A3]") # 한글 범위
+app = Flask(__name__)
 
-def detect_lang(text: str) -> str:
-    if _RE_THAI.search(text):
-        return "th"
-    if _RE_KOREAN.search(text):
-        return "ko"
-    # 기본값: ko 로 간주
-    return "ko"
-
-def translate_ko_th(text: str) -> str:
-    """
-    한국어 <-> 태국어 양방향 번역 프롬프트 (간결/자연스럽게).
-    """
-    src = detect_lang(text)
-    if src == "ko":
-        tgt = "th"
-    else:
-        tgt = "ko"
-
-    system = (
-        "You are a professional translator specializing in Korean↔Thai. "
-        "Translate the user's message as naturally as possible. "
-        "Do not add explanations—return only the translation."
-    )
-    user = f"Source language: {src}\nTarget language: {tgt}\nText: {text}"
-
-    try:
-        resp = oai.chat.completions.create(
-            model=OPENAI_MODEL,
-            messages=[
-                {"role": "system", "content": system},
-                {"role": "user", "content": user},
-            ],
-            temperature=0.2,
-        )
-        return resp.choices[0].message.content.strip()
-    except Exception as e:
-        app.logger.exception("[OpenAI ERROR] %s", e)
-        return None
-
-# ===== 헬스체크 =====
-@app.get("/")
-def health():
+@app.route("/", methods=["GET"])
+def home():
     return "OK", 200
 
-# ===== LINE Webhook 엔드포인트 =====
-@app.post("/callback")
+@app.route("/callback", methods=["POST"])
 def callback():
-    signature = request.headers.get("X-Line-Signature", "")
+    signature = request.headers.get("X-Line-Signature")
     body = request.get_data(as_text=True)
 
-    # 항상 200 반환 (LINE Verify 502 방지)
+    # 원문 이벤트를 찍어서 group/room/user 확인
+    try:
+        j = json.loads(body)
+        print("[EVENT IN]", json.dumps(j, ensure_ascii=False), file=sys.stderr)
+    except Exception as e:
+        print("[EVENT PARSE WARN]", e, file=sys.stderr)
+
     try:
         handler.handle(body, signature)
-    except InvalidSignatureError as e:
-        app.logger.warning("[VERIFY] InvalidSignatureError: %s", e)
+    except InvalidSignatureError:
+        print("[SIGNATURE ERROR] invalid signature", file=sys.stderr)
+        abort(400)
     except Exception as e:
-        app.logger.exception("[WEBHOOK ERROR] %s", e)
+        print("[HANDLE ERROR]", type(e).__name__, str(e), file=sys.stderr)
+        # LINE은 200만 원함. 내부 에러는 로그로만 남기고 200
     return "OK", 200
 
-# ===== 핸들러: 방에 초대/친구추가 =====
-@handler.add(JoinEvent)
-def on_join(event: JoinEvent):
-    welcome = (
-        "안녕하세요! 한국어↔태국어 통역봇입니다.\n"
-        "한국어로 보내면 태국어로, 태국어로 보내면 한국어로 번역해서 답해요. 🥳"
-    )
-    with ApiClient(line_config) as api_client:
-        messaging = MessagingApi(api_client)
-        try:
-            messaging.reply_message(
-                ReplyMessageRequest(
-                    replyToken=event.reply_token,
-                    messages=[TextMessage(text=welcome)]
-                )
-            )
-        except Exception as e:
-            app.logger.exception("[REPLY ERROR / join] %s", e)
+# ── 메시지 이벤트 핸들러 (텍스트) ───────────────────────────
+@handler.add("message")
+def on_message(event):
+    """v3에서는 문자열 타입으로도 이벤트 라우팅 가능.
+       Text만 처리하도록 가드 걸어줌.
+    """
+    try:
+        if not hasattr(event, "message") or event.message.type != "text":
+            return  # 스티커/이미지 등은 무시
 
-@handler.add(FollowEvent)
-def on_follow(event: FollowEvent):
-    hello = (
-        "추가해주셔서 감사합니다! 한국어↔태국어 자동 통역을 도와드려요.\n"
-        "메시지를 보내보세요 👋"
-    )
-    with ApiClient(line_config) as api_client:
-        messaging = MessagingApi(api_client)
-        try:
-            messaging.reply_message(
-                ReplyMessageRequest(
-                    replyToken=event.reply_token,
-                    messages=[TextMessage(text=hello)]
-                )
-            )
-        except Exception as e:
-            app.logger.exception("[REPLY ERROR / follow] %s", e)
+        user_text = (event.message.text or "").strip()
+        source_type = getattr(event.source, "type", "unknown")
+        print("[EVENT META]", {
+            "source_type": source_type,
+            "user_id": getattr(event.source, "userId", None),
+            "group_id": getattr(event.source, "groupId", None),
+            "room_id": getattr(event.source, "roomId", None),
+            "text": user_text
+        }, file=sys.stderr)
 
-# ===== 핸들러: 텍스트 메시지 =====
-@handler.add(MessageEvent, message=TextMessageContent)
-def on_text(event: MessageEvent):
-    incoming = event.message.text.strip()
-    app.logger.info("[INCOMING] %s", incoming)
+        if not user_text:
+            return
 
-    translated = translate_ko_th(incoming)
-    if not translated:
-        translated = "번역 중 문제가 발생했어요. 잠시 후 다시 시도해주세요."
+        # OpenAI 번역 호출
+        completion = client.chat.completions.create(
+            model=OPENAI_MODEL,
+            messages=[
+                {"role": "system",
+                 "content": "너는 번역 도우미야. 한국어↔태국어를 자동으로 감지해서 상대 언어로 자연스럽게 번역해. 존댓말/반말은 문맥에 맞춰 공손하게."},
+                {"role": "user", "content": user_text},
+            ],
+            timeout=25  # reply_token 만료 전 처리 목표
+        )
+        translated = (completion.choices[0].message.content or "").strip()
+        if not translated:
+            translated = "번역 결과가 비어 있어요."
 
-    with ApiClient(line_config) as api_client:
-        messaging = MessagingApi(api_client)
-        try:
-            messaging.reply_message(
+        # v3: ApiClient 컨텍스트에서 MessagingApi 사용
+        with ApiClient(line_config) as api_client:
+            messaging_api = MessagingApi(api_client)
+            messaging_api.reply_message(
                 ReplyMessageRequest(
                     replyToken=event.reply_token,
                     messages=[TextMessage(text=translated)]
                 )
             )
-        except Exception as e:
-            app.logger.exception("[REPLY ERROR] %s", e)
 
-# ---- 로컬 실행용 (Render에선 gunicorn이 실행) ----
+    except Exception as e:
+        print("[ERROR on_message]", type(e).__name__, str(e), file=sys.stderr)
+        # 에러가 나도 reply_token은 최대한 소비하여 사용자에게 안내
+        try:
+            with ApiClient(line_config) as api_client:
+                messaging_api = MessagingApi(api_client)
+                messaging_api.reply_message(
+                    ReplyMessageRequest(
+                        replyToken=event.reply_token,
+                        messages=[TextMessage(text="번역 중 문제가 발생했어요. 잠시 후 다시 시도해주세요.")]
+                    )
+                )
+        except Exception as inner:
+            print("[ReplyError]", inner, file=sys.stderr)
+
 if __name__ == "__main__":
-    # Render는 PORT를 환경변수로 넘겨줌 (없으면 10000)
-    port = int(os.environ.get("PORT", "10000"))
-    app.run(host="0.0.0.0", port=port)
+    # 로컬 실행용 (Render는 gunicorn 사용 권장)
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 10000)))
