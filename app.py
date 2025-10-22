@@ -1,127 +1,108 @@
-# app.py (LINE v3 + Flask + OpenAI / KO<->TH auto-translate stable)
-
+# app.py — v3 SDK, 네이티브 톤 + 번역 방향 라벨
 import os
+import re
 import sys
 import json
-import re
-from typing import Optional
-
 from flask import Flask, request, abort
 
-# === LINE v3 SDK ===
-from linebot.v3 import WebhookHandler
+# LINE v3 SDK
+from linebot.v3.webhooks import MessageEvent, TextMessageContent
+from linebot.v3.webhook import WebhookHandler
 from linebot.v3.messaging import (
-    ApiClient,
-    Configuration,
-    MessagingApi,
-    ReplyMessageRequest,
-    TextMessage,
-)
-from linebot.v3.webhooks import (
-    MessageEvent,
-    TextMessageContent,
+    Configuration, ApiClient, MessagingApi,
+    ReplyMessageRequest, TextMessage
 )
 
-# === OpenAI ===
+# OpenAI
 from openai import OpenAI
-import openai  # 예외 타입 참조용 (openai.RateLimitError 등)
 
 app = Flask(__name__)
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 환경 변수
-# ─────────────────────────────────────────────────────────────────────────────
-LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "").strip()
-LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET", "").strip()
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini").strip()
+# ===== ENV =====
+LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN")
+LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 
-if not LINE_CHANNEL_ACCESS_TOKEN or not LINE_CHANNEL_SECRET:
-    print("[BOOT] LINE env missing. Check LINE_CHANNEL_ACCESS_TOKEN / LINE_CHANNEL_SECRET", file=sys.stderr)
-if not OPENAI_API_KEY:
-    print("[BOOT] OPENAI_API_KEY is missing.", file=sys.stderr)
+if not (LINE_CHANNEL_ACCESS_TOKEN and LINE_CHANNEL_SECRET and OPENAI_API_KEY):
+    print("[FATAL] Missing environment variables.", file=sys.stderr)
+    sys.exit(1)
 
-# ─────────────────────────────────────────────────────────────────────────────
-# LINE SDK v3 초기화
-# ─────────────────────────────────────────────────────────────────────────────
-configuration = Configuration(access_token=LINE_CHANNEL_ACCESS_TOKEN)
-api_client = ApiClient(configuration)
-messaging_api = MessagingApi(api_client)
+# ===== Clients =====
+line_config = Configuration(access_token=LINE_CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(LINE_CHANNEL_SECRET)
+oai = OpenAI(api_key=OPENAI_API_KEY)
 
-# ─────────────────────────────────────────────────────────────────────────────
-# OpenAI 초기화
-# ─────────────────────────────────────────────────────────────────────────────
-openai_client = OpenAI(api_key=OPENAI_API_KEY)
+# ===== Helpers =====
+RE_THAI   = re.compile(r"[\u0E00-\u0E7F]")                 # 태국어
+RE_HANGUL = re.compile(r"[\u1100-\u11FF\u3130-\u318F\uAC00-\uD7A3]")  # 한글(자모+완성형)
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 언어 감지 & 번역 유틸
-# ─────────────────────────────────────────────────────────────────────────────
-THAI_RE   = re.compile(r'[\u0E00-\u0E7F]')  # 태국어
-HANGUL_RE = re.compile(r'[\uAC00-\uD7A3\u1100-\u11FF\u3130-\u318F]')  # 한글(완성형/자모/호환)
-
-def detect_lang(text: str) -> str:
-    """
-    견고한 문자 범위 기반 판별: 'ko' | 'th' | 'unknown'
-    - 태국어 범위 문자가 있으면 'th'
-    - 한글 범위 문자가 있으면 'ko'
-    - 둘 다 있거나 둘 다 없으면 'unknown'
-    """
-    has_th = bool(THAI_RE.search(text))
-    has_ko = bool(HANGUL_RE.search(text))
-    if has_th and not has_ko:
+def detect_lang(text: str):
+    """간단/확정적인 문자 범위 기반 감지 (모델에 의존 X)."""
+    if RE_THAI.search(text):
         return "th"
-    if has_ko and not has_th:
+    if RE_HANGUL.search(text):
         return "ko"
-    return "unknown"
+    return None
 
-def translate_exact(text: str, source: str, target: str, timeout: int = 30) -> str:
+def build_system_prompt(src: str, tgt: str):
     """
-    OpenAI에 소스/타깃을 명시해 번역만 출력하도록 강제.
-    source/target: 'ko' 또는 'th'
+    현지인 톤 지시.
+    - 의미 정확히 전달, 부자연스러운 직역 금지
+    - 원문의 존댓말/반말·말투를 최대한 보존
+    - 이모지/구어체/인터넷 슬랭은 자연스럽게 대응
+    - 불필요한 설명/따옴표/접두사 금지 (번역문만)
     """
-    lang_name = {"ko": "Korean", "th": "Thai"}
-    sys_prompt = (
-        f"You are a professional translator. Translate strictly from {lang_name[source]} "
-        f"to {lang_name[target]}. Output ONLY the translation (no quotes, no language labels, "
-        f"no explanations). Preserve emojis, URLs, and proper nouns."
-    )
-
-    resp = openai_client.chat.completions.create(
-        model=OPENAI_MODEL,
-        messages=[
-            {"role": "system", "content": sys_prompt},
-            {"role": "user",   "content": text},
-        ],
-        temperature=0.0,
-        top_p=1.0,
-        timeout=timeout,
-    )
-    out = (resp.choices[0].message.content or "").strip()
-    return out.strip("`").strip()
-
-def strip_bot_mention(text: str) -> str:
-    """
-    라인 그룹에서 '@봇이름 ' 형태로 멘션될 수 있으므로,
-    맨 앞의 멘션 패턴을 간단히 제거.
-    """
-    # 예: "@Kira Translator2 안녕" -> "안녕"
-    return re.sub(r"^@\S+(?:\s+|：|:)\s*", "", text).strip()
-
-def reply_text(reply_token: str, text: str) -> None:
-    try:
-        messaging_api.reply_message(
-            ReplyMessageRequest(
-                reply_token=reply_token,
-                messages=[TextMessage(text=text[:5000])]  # LINE 메시지 길이 방지
-            )
+    if src == "ko" and tgt == "th":
+        return (
+            "역할: 한->태 통역사.\n"
+            "원문의 뉘앙스·존댓말/반말을 유지하되, 태국 현지인이 쓰는 자연스러운 구어체로 번역해.\n"
+            "사투리/은어는 태국에서 통하는 자연스러운 표현으로 옮겨.\n"
+            "번역문만 답하고, 추가 설명은 하지 마."
         )
-    except Exception as e:
-        print("[ReplyError]", type(e).__name__, str(e), file=sys.stderr)
+    if src == "th" and tgt == "ko":
+        return (
+            "역할: 태->한 통역사.\n"
+            "원문의 뉘앙스·존댓말/반말을 유지하되, 한국인이 쓰는 자연스러운 구어체로 번역해.\n"
+            "태국식 표현은 한국어에서 어색하지 않게 자연스럽게 바꿔.\n"
+            "번역문만 답하고, 추가 설명은 하지 마."
+        )
+    return "입력 문장을 자연스럽고 정확하게 번역해. 번역문만 답해."
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 라우트
-# ─────────────────────────────────────────────────────────────────────────────
+def translate_native(user_text: str):
+    src = detect_lang(user_text)
+    if src == "ko":
+        tgt = "th"
+        tag = "🇰🇷→🇹🇭"
+    elif src == "th":
+        tgt = "ko"
+        tag = "🇹🇭→🇰🇷"
+    else:
+        # 지원 외 언어 또는 감지 실패
+        return None, (
+            "지원 언어는 한국어/태국어입니다.\n"
+            "• 한국어 → 태국어\n• 태국어 → 한국어\n"
+            "해당 언어로 다시 보내주세요."
+        )
+
+    system_prompt = build_system_prompt(src, tgt)
+
+    try:
+        resp = oai.chat.completions.create(
+            model=OPENAI_MODEL,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_text},
+            ],
+            timeout=30,
+        )
+        out = (resp.choices[0].message.content or "").strip()
+        return tag, out
+    except Exception as e:
+        print("[OpenAI ERROR]", repr(e), file=sys.stderr)
+        return None, "번역 중 문제가 발생했어요. 잠시 후 다시 시도해주세요."
+
+# ===== Routes =====
 @app.route("/", methods=["GET"])
 def home():
     return "OK", 200
@@ -130,67 +111,41 @@ def home():
 def callback():
     signature = request.headers.get("X-Line-Signature", "")
     body = request.get_data(as_text=True)
-
-    # 관찰용 로그
     try:
-        print("[EVENT IN]", body, file=sys.stdout)
-    except Exception:
-        pass
-
-    try:
+        # 디버깅용 간단 로그
+        app.logger.info("[EVENT IN] %s", body)
         handler.handle(body, signature)
     except Exception as e:
-        # 서명 오류/파싱 오류 등은 400으로 응답
-        print("[WebhookError]", type(e).__name__, str(e), file=sys.stderr)
+        print("[Webhook ERROR]", repr(e), file=sys.stderr)
         abort(400)
     return "OK", 200
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 이벤트 핸들러 (v3 스타일)
-# ─────────────────────────────────────────────────────────────────────────────
+# ===== Handlers =====
 @handler.add(MessageEvent, message=TextMessageContent)
 def on_message(event: MessageEvent):
-    """
-    한국어만 오면 태국어로, 태국어만 오면 한국어로 번역.
-    둘 다 없거나 섞이면 안내 문구.
-    """
+    user_text = (event.message.text or "").strip()
+    app.logger.info("[MESSAGE] %s", user_text)
+
+    tag, result = translate_native(user_text)
+
+    # 방향 라벨 붙여서 명확히
+    if tag:
+        reply_text = f"{tag}\n{result}"
+    else:
+        reply_text = result
+
     try:
-        user_text = (event.message.text or "").strip()
-        print("[MESSAGE]", user_text, file=sys.stdout)
-
-        # 멘션 제거
-        clean_text = strip_bot_mention(user_text)
-        if not clean_text:
-            return
-
-        src = detect_lang(clean_text)
-        if src == "ko":
-            tgt = "th"
-        elif src == "th":
-            tgt = "ko"
-        else:
-            reply_text(
-                event.reply_token,
-                "지원 언어는 한국어/태국어입니다. 한국어는 태국어로, 태국어는 한국어로 번역해 드려요."
+        with ApiClient(line_config) as api_client:
+            MessagingApi(api_client).reply_message(
+                ReplyMessageRequest(
+                    reply_token=event.reply_token,
+                    messages=[TextMessage(text=reply_text)]
+                )
             )
-            return
-
-        translated = translate_exact(clean_text, src, tgt)
-        # 혹시 모델이 설명을 붙였을 가능성 대비: 한 줄 요약만
-        translated = translated.splitlines()[0].strip() if translated else ""
-        if not translated:
-            translated = "번역 결과가 비어 있습니다. 다시 시도해주세요."
-        reply_text(event.reply_token, translated)
-
-    except openai.RateLimitError:
-        reply_text(event.reply_token, "번역 사용량이 초과되었습니다. 잠시 후 다시 시도해주세요.")
     except Exception as e:
-        print("[ERROR]", type(e).__name__, str(e), file=sys.stderr)
-        reply_text(event.reply_token, "번역 중 오류가 발생했어요. 잠시 후 다시 시도해주세요.")
+        print("[LINE Reply ERROR]", repr(e), file=sys.stderr)
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 로컬 실행 (Render에서는 Gunicorn으로 구동)
-# ─────────────────────────────────────────────────────────────────────────────
+# ===== Main (Render에서는 gunicorn 사용, 로컬 테스트용) =====
 if __name__ == "__main__":
-    port = int(os.getenv("PORT", 10000))
+    port = int(os.getenv("PORT", "10000"))
     app.run(host="0.0.0.0", port=port)
