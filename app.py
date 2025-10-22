@@ -77,7 +77,7 @@ def on_message(event):
                 },
                 {"role": "user", "content": user_text},
             ],
-            timeout=25,  # replyToken 만료 전에 끝내기
+            timeout=1,  # replyToken 만료 전에 끝내기
         )
         translated = (completion.choices[0].message.content or "").strip()
     except Exception:
