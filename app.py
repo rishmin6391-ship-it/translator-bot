@@ -1,4 +1,4 @@
-# app.py — v3 SDK, 지속 설정 + 최적화 + 방향 라벨
+# -*- coding: utf-8 -*-
 import os
 import re
 import sys
@@ -6,7 +6,6 @@ import json
 import time
 import threading
 from typing import Optional, Tuple
-
 from flask import Flask, request, abort
 
 # ===== LINE v3 SDK =====
@@ -19,6 +18,7 @@ from linebot.v3.messaging import (
 
 # ===== OpenAI =====
 from openai import OpenAI
+import httpx
 
 app = Flask(__name__)
 
@@ -28,77 +28,31 @@ LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 
-# 채팅방 설정 파일 경로(영구 저장 위치). Render의 Persistent Disk를 /data 로 마운트하면 재배포/재시작 뒤에도 유지됩니다.
-SETTINGS_PATH = os.getenv("SETTINGS_PATH", "/data/settings.json")
-
 if not (LINE_CHANNEL_ACCESS_TOKEN and LINE_CHANNEL_SECRET and OPENAI_API_KEY):
-    print("[FATAL] Missing environment variables.", file=sys.stderr)
+    print("[FATAL] Missing env: LINE_CHANNEL_ACCESS_TOKEN / LINE_CHANNEL_SECRET / OPENAI_API_KEY", file=sys.stderr)
     sys.exit(1)
 
-# ===== Clients (재사용) =====
+# ===== Filesystem: Render에서 쓰기 가능 경로로 설정 (권한 오류 방지) =====
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))               # /opt/render/project/src
+DATA_DIR = os.path.join(BASE_DIR, "data")                           # 프로젝트 폴더 안쪽
+SETTINGS_PATH = os.path.join(DATA_DIR, "settings.json")             # 방별 설정 저장
+os.makedirs(DATA_DIR, exist_ok=True)
+
+# ===== LINE/OpenAI Clients =====
 line_config = Configuration(access_token=LINE_CHANNEL_ACCESS_TOKEN)
-# ApiClient / MessagingApi를 전역으로 재사용(keep-alive)
-_line_api_client = ApiClient(line_config)
-_line_api = MessagingApi(_line_api_client)
-
 handler = WebhookHandler(LINE_CHANNEL_SECRET)
-oai = OpenAI(api_key=OPENAI_API_KEY)
 
-# ===== Regex for Language Detection =====
+# OpenAI: 저지연 httpx 설정 (Keep-Alive, 짧은 통신 타임아웃)
+oai_http = httpx.Client(
+    timeout=httpx.Timeout(connect=2.0, read=6.0, write=3.0, pool=6.0),  # 5초 넘지 않도록 타이트하게
+    limits=httpx.Limits(max_keepalive_connections=20, max_connections=40),
+)
+oai = OpenAI(api_key=OPENAI_API_KEY, http_client=oai_http)
+
+# ===== Language detection (정확·가벼움) =====
 RE_THAI   = re.compile(r"[\u0E00-\u0E7F]")  # 태국어
-RE_HANGUL = re.compile(r"[\u1100-\u11FF\u3130-\u318F\uAC00-\uD7A3]")  # 한글(자모+완성형)
+RE_HANGUL = re.compile(r"[\u1100-\u11FF\u3130-\u318F\uAC00-\uD7A3]")  # 한글
 
-# ===== Settings Store (Thread-safe) =====
-_settings_lock = threading.Lock()
-_chat_settings = {}  # {chat_id: {"mode": "auto"|"ko->th"|"th->ko"}}
-
-def _load_settings():
-    os.makedirs(os.path.dirname(SETTINGS_PATH), exist_ok=True)
-    if not os.path.exists(SETTINGS_PATH):
-        return
-    try:
-        with open(SETTINGS_PATH, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        if isinstance(data, dict):
-            _chat_settings.update(data)
-    except Exception as e:
-        print("[WARN] Failed to load settings:", e, file=sys.stderr)
-
-def _save_settings():
-    tmp = SETTINGS_PATH + ".tmp"
-    try:
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(_chat_settings, f, ensure_ascii=False, indent=2)
-        os.replace(tmp, SETTINGS_PATH)
-    except Exception as e:
-        print("[WARN] Failed to save settings:", e, file=sys.stderr)
-
-# 초기 로드
-_load_settings()
-
-def _get_chat_id(event: MessageEvent) -> str:
-    """그룹/룸/1:1 구분하여 채팅방 ID를 반환."""
-    src = event.source
-    # v3 모델에서 속성명 스네이크/카멜 혼용 대응
-    group_id = getattr(src, "group_id", getattr(src, "groupId", None))
-    room_id  = getattr(src, "room_id", getattr(src, "roomId", None))
-    user_id  = getattr(src, "user_id", getattr(src, "userId", None))
-    if group_id:
-        return f"group:{group_id}"
-    if room_id:
-        return f"room:{room_id}"
-    return f"user:{user_id}"
-
-def get_mode(chat_id: str) -> str:
-    with _settings_lock:
-        return _chat_settings.get(chat_id, {}).get("mode", "auto")
-
-def set_mode(chat_id: str, mode: str) -> None:
-    with _settings_lock:
-        _chat_settings.setdefault(chat_id, {})["mode"] = mode
-        _save_settings()
-
-# ===== Language + Prompt =====
 def detect_lang(text: str) -> Optional[str]:
     if RE_THAI.search(text):
         return "th"
@@ -106,150 +60,235 @@ def detect_lang(text: str) -> Optional[str]:
         return "ko"
     return None
 
-def build_system_prompt(src: str, tgt: str) -> str:
-    if src == "ko" and tgt == "th":
-        return (
-            "역할: 한→태 통역사.\n"
-            "원문의 말투(존댓말/반말·감정·유머)를 유지하되, 태국 현지인이 쓰는 자연스러운 구어체로 번역해.\n"
-            "불필요한 설명/따옴표/접두사 금지. 번역문만."
-        )
-    if src == "th" and tgt == "ko":
-        return (
-            "역할: 태→한 통역사.\n"
-            "원문의 말투(존댓말/반말·감정·유머)를 유지하되, 한국인이 쓰는 자연스러운 구어체로 번역해.\n"
-            "불필요한 설명/따옴표/접두사 금지. 번역문만."
-        )
+# ======= 방별 설정(언어페어/호출 트리거 등) 저장/로드 =======
+_lock = threading.Lock()
+_default_room_cfg = {
+    "mode": "auto",        # "auto": ko<->th 자동, 또는 "ko2th"/"th2ko" 강제
+    "prefix": "",          # 특정 접두사(@봇, !tr 등) 요구 시 설정. 빈 문자열이면 무조건 번역
+    "native_tone": True    # 현지 구어체 톤 사용
+}
+_settings_cache = {"rooms": {}}  # { roomId(or userId): cfg }
+
+def _atomic_write_json(path: str, data: dict):
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, path)
+
+def _load_settings():
+    global _settings_cache
+    if not os.path.exists(SETTINGS_PATH):
+        _settings_cache = {"rooms": {}}
+        _atomic_write_json(SETTINGS_PATH, _settings_cache)
+        return
+    try:
+        with open(SETTINGS_PATH, "r", encoding="utf-8") as f:
+            _settings_cache = json.load(f)
+            if "rooms" not in _settings_cache:
+                _settings_cache = {"rooms": {}}
+    except Exception as e:
+        print("[WARN] settings load failed:", repr(e), file=sys.stderr)
+        _settings_cache = {"rooms": {}}
+
+def _save_settings():
+    try:
+        _atomic_write_json(SETTINGS_PATH, _settings_cache)
+    except Exception as e:
+        print("[WARN] settings save failed:", repr(e), file=sys.stderr)
+
+def get_room_cfg(room_id: str) -> dict:
+    with _lock:
+        room = _settings_cache["rooms"].get(room_id)
+        if not room:
+            room = dict(_default_room_cfg)
+            _settings_cache["rooms"][room_id] = room
+            _save_settings()
+        return room
+
+def update_room_cfg(room_id: str, **fields):
+    with _lock:
+        room = _settings_cache["rooms"].get(room_id) or dict(_default_room_cfg)
+        room.update({k: v for k, v in fields.items() if v is not None})
+        _settings_cache["rooms"][room_id] = room
+        _save_settings()
+
+# 처음 기동 시 로드
+_load_settings()
+
+# ===== 프롬프트 =====
+def build_system_prompt(src: str, tgt: str, native_tone: bool) -> str:
+    if native_tone:
+        if src == "ko" and tgt == "th":
+            return (
+                "역할: 한→태 통역사.\n"
+                "원문의 뉘앙스/존댓말/반말을 유지하되, 태국 현지인이 쓰는 자연스러운 구어체로 번역해.\n"
+                "불필요한 설명·따옴표 금지. 번역문만."
+            )
+        if src == "th" and tgt == "ko":
+            return (
+                "역할: 태→한 통역사.\n"
+                "원문의 뉘앙스/존댓말/반말을 유지하되, 한국인이 쓰는 자연스러운 구어체로 번역해.\n"
+                "불필요한 설명·따옴표 금지. 번역문만."
+            )
     return "입력 문장을 자연스럽고 정확하게 번역해. 번역문만."
 
-# ===== OpenAI 호출(지연 최소 + 재시도) =====
-def chat_translate(system_prompt: str, user_text: str, timeout_s: float = 8.0) -> str:
-    # 가벼운 재시도: 3회, 지수 백오프(0.4s, 0.8s)
-    delays = [0.0, 0.4, 0.8]
-    last_err = None
-    for delay in delays:
-        if delay:
-            time.sleep(delay)
-        try:
-            resp = oai.chat.completions.create(
-                model=OPENAI_MODEL,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_text},
-                ],
-                timeout=timeout_s,
-            )
-            out = (resp.choices[0].message.content or "").strip()
-            return out
-        except Exception as e:
-            last_err = e
-    print("[OpenAI ERROR]", repr(last_err), file=sys.stderr)
-    return "번역 중 문제가 발생했어요. 잠시 후 다시 시도해주세요."
-
-# ===== 번역 라우팅 =====
-def translate_with_mode(user_text: str, mode: str) -> Tuple[str, str]:
+def choose_direction(text: str, mode: str) -> Optional[Tuple[str, str, str]]:
     """
-    mode: "auto" | "ko->th" | "th->ko"
-    return: (tag, translated_text)  tag는 방향 라벨(없으면 "")
+    반환: (src, tgt, tag) 또는 None
     """
-    if mode == "ko->th":
-        src, tgt, tag = "ko", "th", "🇰🇷→🇹🇭"
-    elif mode == "th->ko":
-        src, tgt, tag = "th", "ko", "🇹🇭→🇰🇷"
-    else:
-        # auto
-        det = detect_lang(user_text)
-        if det == "ko":
-            src, tgt, tag = "ko", "th", "🇰🇷→🇹🇭"
-        elif det == "th":
-            src, tgt, tag = "th", "ko", "🇹🇭→🇰🇷"
-        else:
-            help_msg = (
-                "지원 언어는 한국어/태국어입니다.\n"
-                "• 한국어 → 태국어\n• 태국어 → 한국어\n"
-                "또는 채팅방에서 ‘설정 한국어→태국어’, ‘설정 태국어→한국어’, ‘자동감지’, ‘상태’ 를 사용할 수 있어요."
-            )
-            return "", help_msg
-
-    system_prompt = build_system_prompt(src, tgt)
-    out = chat_translate(system_prompt, user_text)
-    return tag, out
-
-# ===== 명령어 처리 =====
-def maybe_handle_command(chat_id: str, text: str) -> Optional[str]:
-    t = text.strip().replace(" ", "")
-    if t in ("상태", "/상태", "상태보기"):
-        mode = get_mode(chat_id)
-        if mode == "ko->th":
-            return "현재 모드: 🇰🇷→🇹🇭 (한국어를 태국어로)"
-        if mode == "th->ko":
-            return "현재 모드: 🇹🇭→🇰🇷 (태국어를 한국어로)"
-        return "현재 모드: 자동감지 (한국어↔태국어 자동 번역)"
-
-    if t in ("자동감지", "/자동", "기본모드"):
-        set_mode(chat_id, "auto")
-        return "이제 자동감지 모드입니다. (한국어↔태국어 자동 번역)"
-
-    patterns = ("설정한국어→태국어", "설정한국어->태국어", "설정한→태", "설정ko→th", "설정ko->th")
-    if any(t == p for p in patterns):
-        set_mode(chat_id, "ko->th")
-        return "이 채팅방은 이제 🇰🇷→🇹🇭 모드입니다. (한국어를 태국어로 번역)"
-
-    patterns = ("설정태국어→한국어", "설정태국어->한국어", "설정태→한", "설정th→ko", "설정th->ko")
-    if any(t == p for p in patterns):
-        set_mode(chat_id, "th->ko")
-        return "이 채팅방은 이제 🇹🇭→🇰🇷 모드입니다. (태국어를 한국어로 번역)"
-
+    if mode == "ko2th":
+        return ("ko", "th", "🇰🇷→🇹🇭")
+    if mode == "th2ko":
+        return ("th", "ko", "🇹🇭→🇰🇷")
+    # auto
+    src = detect_lang(text)
+    if src == "ko":
+        return ("ko", "th", "🇰🇷→🇹🇭")
+    if src == "th":
+        return ("th", "ko", "🇹🇭→🇰🇷")
     return None
 
-# ===== Routes =====
+# ===== 번역 (저지연/내결함성) =====
+def translate_text(user_text: str, src: str, tgt: str, native_tone: bool) -> str:
+    sys_prompt = build_system_prompt(src, tgt, native_tone)
+    try:
+        # 짧은 답변 유도 -> latency 절감
+        resp = oai.chat.completions.create(
+            model=OPENAI_MODEL,
+            messages=[
+                {"role": "system", "content": sys_prompt},
+                {"role": "user", "content": user_text},
+            ],
+            max_tokens=120,        # 과도한 토큰 방지
+            temperature=0.3,       # 일관성↑, 속도↑
+            timeout=8,             # 5초 목표 내 타임아웃 타이트
+        )
+        return (resp.choices[0].message.content or "").strip()
+    except Exception as e:
+        print("[OpenAI ERROR]", repr(e), file=sys.stderr)
+        return "지금은 번역 서버가 혼잡합니다. 잠시 후 다시 시도해주세요."
+
+# ===== 라우팅 =====
 @app.route("/", methods=["GET"])
 def home():
     return "OK", 200
+
+@app.route("/healthz", methods=["GET"])
+def health():
+    return "ok", 200
 
 @app.route("/callback", methods=["POST"])
 def callback():
     signature = request.headers.get("X-Line-Signature", "")
     body = request.get_data(as_text=True)
     try:
-        app.logger.info("[EVENT IN] %s", body[:2000])  # 과한 로그 방지
+        # 오래된 이벤트(예: 슬립 뒤 깨우기) 무시 -> 불필요 지연 제거
+        payload = json.loads(body)
+        for ev in payload.get("events", []):
+            ts = ev.get("timestamp")
+            if ts and (time.time() * 1000 - int(ts) > 60_000):
+                app.logger.info("[SKIP old event] %s", ev.get("webhookEventId"))
+                return "OK", 200
+        app.logger.info("[EVENT IN] %s", body)
         handler.handle(body, signature)
     except Exception as e:
         print("[Webhook ERROR]", repr(e), file=sys.stderr)
         abort(400)
     return "OK", 200
 
-# ===== Handler =====
+# ===== 명령어(방 설정) 파서 =====
+def try_handle_command(room_id: str, text: str) -> Optional[str]:
+    t = text.strip().lower()
+    if t in ("!mode auto", "!auto"):
+        update_room_cfg(room_id, mode="auto")
+        return "번역 모드: 자동(한국어↔태국어 인식)으로 설정되었습니다."
+    if t in ("!mode ko2th", "!ko2th"):
+        update_room_cfg(room_id, mode="ko2th")
+        return "번역 모드: 한국어 → 태국어 고정."
+    if t in ("!mode th2ko", "!th2ko"):
+        update_room_cfg(room_id, mode="th2ko")
+        return "번역 모드: 태국어 → 한국어 고정."
+    if t.startswith("!prefix "):
+        prefix = t.split(" ", 1)[1].strip()
+        update_room_cfg(room_id, prefix=prefix)
+        return f"번역 트리거 접두사(prefix): '{prefix}' 로 설정되었습니다. (빈 문자열이면 항상 번역)"
+    if t == "!native on":
+        update_room_cfg(room_id, native_tone=True)
+        return "현지 구어체 톤: ON"
+    if t == "!native off":
+        update_room_cfg(room_id, native_tone=False)
+        return "현지 구어체 톤: OFF"
+    if t in ("!help", "/help"):
+        return (
+            "번역봇 설정 명령어:\n"
+            "• !mode auto | !mode ko2th | !mode th2ko\n"
+            "• !prefix <문자열>  (예: !prefix @tr)\n"
+            "• !native on|off    (현지 구어체 톤)\n"
+            "• !help"
+        )
+    return None
+
+# ===== 핸들러 =====
 @handler.add(MessageEvent, message=TextMessageContent)
 def on_message(event: MessageEvent):
     user_text = (event.message.text or "").strip()
-    chat_id = _get_chat_id(event)
-    app.logger.info("[MESSAGE] chat=%s text=%s", chat_id, user_text)
+    room_id = None
+    if event.source.type == "group":
+        room_id = event.source.group_id
+    elif event.source.type == "room":
+        room_id = event.source.room_id
+    else:
+        room_id = event.source.user_id
 
-    # 1) 명령어 먼저 처리
-    cmd_resp = maybe_handle_command(chat_id, user_text)
-    if cmd_resp is not None:
-        _reply(event.reply_token, cmd_resp)
+    # 방 설정 로드
+    cfg = get_room_cfg(room_id)
+
+    # 접두사(prefix) 요구 설정 시: 접두사 없으면 패스
+    if cfg.get("prefix"):
+        if not user_text.startswith(cfg["prefix"]):
+            # 접두사가 없고, 다만 명령어는 항상 처리
+            cmd = try_handle_command(room_id, user_text)
+            if cmd:
+                _reply(event.reply_token, cmd)
+            return
+        else:
+            # 접두사 제거 후 번역
+            user_text = user_text[len(cfg["prefix"]):].lstrip()
+
+    # 먼저 명령어 판별
+    cmd = try_handle_command(room_id, user_text)
+    if cmd:
+        _reply(event.reply_token, cmd)
         return
 
-    # 2) 현재 모드로 번역
-    mode = get_mode(chat_id)
-    tag, result = translate_with_mode(user_text, mode)
-    reply_text = f"{tag}\n{result}" if tag else result
+    # 번역 방향 결정
+    choice = choose_direction(user_text, cfg.get("mode", "auto"))
+    if not choice:
+        _reply(event.reply_token,
+               "지원 언어는 한국어/태국어 입니다.\n"
+               "• !mode auto (자동) / !mode ko2th / !mode th2ko\n"
+               "• !help 로 명령어를 확인하세요.")
+        return
+
+    src, tgt, tag = choice
+    result = translate_text(user_text, src, tgt, cfg.get("native_tone", True))
+    reply_text = f"{tag}\n{result}"
     _reply(event.reply_token, reply_text)
 
 def _reply(reply_token: str, text: str):
     try:
-        _line_api.reply_message(
-            ReplyMessageRequest(
-                reply_token=reply_token,
-                messages=[TextMessage(text=text)]
+        with ApiClient(line_config) as api_client:
+            MessagingApi(api_client).reply_message(
+                ReplyMessageRequest(
+                    reply_token=reply_token,
+                    messages=[TextMessage(text=text[:4900])]  # LINE 5,000자 근사 제한
+                )
             )
-        )
     except Exception as e:
         print("[LINE Reply ERROR]", repr(e), file=sys.stderr)
 
-# ===== Main (로컬 테스트용) =====
+# ===== Main (로컬 테스트) =====
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "10000"))
-    # 로컬에서 빠른 응답 확인용
-    app.run(host="0.0.0.0", port=port)
+    # Flask의 reloader 비활성화 -> 기동 시간 단축
+    app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
