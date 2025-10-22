@@ -1,15 +1,33 @@
-# Translator Bot (Final Stable Version)
-LINE 메시지를 자동 번역하는 봇입니다.
+# LINE Translator Bot (Korean ↔ Thai) — LINE SDK v3
 
-## 구성
-- Python 3.11.9
-- Flask 서버
-- LINE Messaging API
-- OpenAI API (gpt-4o-mini)
+## 1) 준비물
+- LINE Official Account (Bot), Messaging API 활성화
+- LINE Developers Console에서:
+  - Channel secret / Channel access token 확보
+  - "그룹 초대 허용" ON
+  - "응답 모드"가 UI에 없다면 기본 Bot 모드로 동작 (SDK v3 기준, 웹훅만 켜져 있으면 됩니다)
 
-## Render 배포
-1. GitHub 업로드
-2. Render에서 새 Web Service 생성
-3. 환경 변수 설정
-4. Manual Deploy → Deploy latest commit
-5. Verify Webhook → 대화 테스트
+## 2) 환경변수
+- LINE_CHANNEL_SECRET
+- LINE_CHANNEL_ACCESS_TOKEN
+- OPENAI_API_KEY
+- (선택) OPENAI_MODEL=gpt-4o-mini
+
+## 3) 배포(Render)
+- 리포 업로드
+- runtime.txt 에 python-3.11.9
+- requirements.txt, Procfile 포함
+- Build Command:
+  pip install --upgrade pip wheel setuptools && pip install --no-cache-dir -r requirements.txt
+- Start Command:
+  gunicorn app:app --bind 0.0.0.0:${PORT} --workers 2 --threads 8 --timeout 60 --graceful-timeout 30 --keep-alive 75 --max-requests 1000 --max-requests-jitter 100 --preload
+
+## 4) Webhook 설정
+- 배포 URL 예: https://<your-service>.onrender.com
+- LINE Console → Messaging API → Webhook URL:
+  https://<your-service>.onrender.com/callback
+- Use webhook: ON → Verify (200 OK)
+
+## 5) 테스트
+- 1:1 채팅 또는 그룹방에 봇 초대
+- 한국어/태국어로 아무 말 입력 → 상호 번역되어 응답
