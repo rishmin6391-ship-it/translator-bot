@@ -3,7 +3,9 @@ import re
 import sys
 import json
 import time
-from typing import Optional, Tuple, Dict, Any
+from typing import Optional, Dict, Any, List
+from collections import defaultdict, deque
+
 from flask import Flask, request, abort
 
 # ===== LINE v3 SDK =====
@@ -23,7 +25,7 @@ app = Flask(__name__)
 LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN")
 LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o")  # 품질 우선 (필요시 gpt-4o-mini 등으로 조정)
 
 if not (LINE_CHANNEL_ACCESS_TOKEN and LINE_CHANNEL_SECRET and OPENAI_API_KEY):
     print("[FATAL] Missing environment variables.", file=sys.stderr)
@@ -34,8 +36,8 @@ STATE_DIR = os.getenv("TRANSLATOR_STATE_DIR", "/opt/render/persistent/translator
 STATE_FILE = "state.json"
 STATE_PATH = os.path.join(STATE_DIR, STATE_FILE)
 
-# 안전한 디렉토리 만들기 (권한 오류 시 폴백)
 def _ensure_state_dir() -> str:
+    """권한 문제 없는 쓰기 가능 디렉토리 확보."""
     path_order = [STATE_DIR, "/opt/render/persistent/translator_state", "./translator_state"]
     for p in path_order:
         try:
@@ -48,7 +50,6 @@ def _ensure_state_dir() -> str:
         except Exception as e:
             print(f"[WARN] state dir '{p}' not usable: {e}", file=sys.stderr)
             continue
-    # 마지막 폴백
     return "./translator_state"
 
 STATE_DIR = _ensure_state_dir()
@@ -60,7 +61,7 @@ line_config = Configuration(access_token=LINE_CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(LINE_CHANNEL_SECRET)
 oai = OpenAI(api_key=OPENAI_API_KEY)
 
-# ===== In-memory cache (디스크 + 메모리) =====
+# ===== In-memory state (디스크 + 메모리) =====
 _state_mem: Dict[str, Any] = {}
 _state_loaded = False
 _state_last_flush = 0.0
@@ -73,7 +74,7 @@ def _load_state():
         if os.path.exists(STATE_PATH):
             with open(STATE_PATH, "r", encoding="utf-8") as f:
                 _state_mem = json.load(f)
-            print(f"[STATE] Loaded {_safe_size(_state_mem)} entries")
+            print(f"[STATE] Loaded entries: {len(_state_mem) if isinstance(_state_mem, dict) else '?'}")
         else:
             _state_mem = {}
         _state_loaded = True
@@ -83,14 +84,8 @@ def _load_state():
         _state_mem = {}
         _state_loaded = True
 
-def _safe_size(d):
-    try:
-        return len(d)
-    except Exception:
-        return "?"
-
 def _flush_state(force: bool = False):
-    """디스크 쓰기는 5초에 한 번만 (burst 보호)."""
+    """디스크 쓰기는 5초에 한 번 (burst 보호)."""
     global _state_last_flush
     now = time.time()
     if not force and (now - _state_last_flush) < 5.0:
@@ -104,24 +99,8 @@ def _flush_state(force: bool = False):
     except Exception as e:
         print("[STATE] Flush failed:", repr(e), file=sys.stderr)
 
-# ===== Simple helpers =====
-RE_THAI   = re.compile(r"[\u0E00-\u0E7F]")  # Thai
-RE_HANGUL = re.compile(r"[\u1100-\u11FF\u3130-\u318F\uAC00-\uD7A3]")  # Hangul (Jamo+Syllables)
-
-EMOJI_REGEX = re.compile(
-    r"["
-    r"\U0001F600-\U0001F64F"  # emoticons
-    r"\U0001F300-\U0001F5FF"  # symbols & pictographs
-    r"\U0001F680-\U0001F6FF"  # transport & map
-    r"\U0001F1E0-\U0001F1FF"  # flags (iOS)
-    r"]+", flags=re.UNICODE
-)
-
-KOREAN_REACTIONS = re.compile(r"(ㅋ+|ㅎ+|^ㅠ+|^ㅜ+|^ㄷㄷ|^ㅇㅇ|^ㄴㄴ|^ㅅㅂ|^ㅈㅅ|^넵|^넹|^ㅇㅋ|^\^\^)$")
-THAI_REACTIONS   = re.compile(r"^(5{2,}|555+|คริ|คิคิ|ฮ่า+)$")  # 555=웃음
-
 def _room_key(evt: MessageEvent) -> str:
-    """그룹/룸/1:1 각각을 고유키로 식별."""
+    """그룹/룸/1:1 별로 고유키 생성."""
     src = evt.source
     if src.type == "group":
         return f"group:{src.group_id}"
@@ -140,55 +119,65 @@ def _put_last_lang(key: str, lang: str):
     _state_mem[key]["last_lang"] = lang
     _flush_state()
 
+# ===== Language/emoji detectors =====
+RE_THAI   = re.compile(r"[\u0E00-\u0E7F]")  # Thai block
+RE_HANGUL = re.compile(r"[\u1100-\u11FF\u3130-\u318F\uAC00-\uD7A3]")  # Hangul blocks
+EMOJI_REGEX = re.compile(
+    r"["
+    r"\U0001F600-\U0001F64F"  # emoticons
+    r"\U0001F300-\U0001F5FF"  # symbols & pictographs
+    r"\U0001F680-\U0001F6FF"  # transport & map symbols
+    r"\U0001F1E0-\U0001F1FF"  # flags
+    r"]+", flags=re.UNICODE
+)
+# 간단 반응(한국/태국 커뮤니티에서 흔함)
+KOREAN_REACTIONS = re.compile(r"^(ㅋ+|ㅎ+|ㅠ+|ㅜ+|ㄷㄷ|ㅇㅇ|ㄴㄴ|\^\^|넵|넹|ㅇㅋ)$")
+THAI_REACTIONS   = re.compile(r"^(5{2,}|555+|คริ+|คิคิ+|ฮ่า+)$")
+
+def _looks_like_only_emoji_or_reaction(text: str) -> bool:
+    s = text.strip()
+    if not s:
+        return True
+    if EMOJI_REGEX.fullmatch(s):
+        return True
+    if KOREAN_REACTIONS.fullmatch(s) or THAI_REACTIONS.fullmatch(s):
+        return True
+    return False
+
 def detect_lang(text: str, last_lang: Optional[str]) -> Optional[str]:
-    """문자 범위 + 반응 패턴 + 이모지 기반. 미검출 시 최근 언어 유지."""
+    """문자 범위 + 반응사 + 이모지. 미검출 시 최근 언어 유지."""
     if RE_THAI.search(text):
         return "th"
     if RE_HANGUL.search(text):
         return "ko"
-
-    # 반응사/이모지 → 최근 언어 유지
+    # 반응사/이모지 → 최근 언어 유지(없으면 None)
     if KOREAN_REACTIONS.search(text):
         return last_lang or "ko"
     if THAI_REACTIONS.search(text):
         return last_lang or "th"
-    if EMOJI_REGEX.search(text) or text.strip() in {"ㅋㅋ", "ㅎㅎ", "^^", "ㅠㅠ", "ㅜㅜ"}:
-        return last_lang  # 최근 언어 그대로 (없으면 None 반환)
-
+    if EMOJI_REGEX.search(text):
+        return last_lang
     return None
 
+# ===== System prompt (자연스러운 현지 톤) =====
 def build_system_prompt(src: str, tgt: str) -> str:
     if src == "ko" and tgt == "th":
         return (
-            "역할: 한→태 통역사.\n"
-            "원문의 뉘앙스·존댓말/반말을 유지하되, 태국 현지인이 쓰는 자연스러운 구어체로 번역해.\n"
-            "사투리/은어는 태국에서 통하는 자연스러운 표현으로 옮겨.\n"
-            "번역문만 답하고, 따옴표/설명/접두사는 쓰지 마."
+            "너는 태국 현지인 통역사야.\n"
+            "한국어를 태국어로 번역할 때 번역투를 피하고, 자연스럽고 부드러운 구어체로 표현해.\n"
+            "문장의 어감, 존댓말·반말 톤을 유지하되, 상황에 맞는 자연스러운 태국어로 다듬어.\n"
+            "친근한 대화는 친근하게, 격식 있는 말은 공손하게.\n"
+            "원문의 의미는 바꾸지 말고, 추가 설명/따옴표/접두사 없이 번역문만 출력해."
         )
     if src == "th" and tgt == "ko":
         return (
-            "역할: 태→한 통역사.\n"
-            "원문의 뉘앙스·존댓말/반말은 살리되, 한국인이 자연스럽게 쓰는 표현으로 번역해.\n"
-            "태국식 직역은 피하고 한국어 문맥에 맞게 다듬어.\n"
-            "번역문만 답하고, 따옴표/설명/접두사는 쓰지 마."
+            "너는 한국인 통역사야.\n"
+            "태국어를 한국어로 번역할 때 번역투를 피하고, 실제 한국인이 쓰는 자연스러운 구어체로 표현해.\n"
+            "태국식 직역은 피하고, 한국어 맥락에 맞게 어투·어감을 다듬어.\n"
+            "친근한 대화는 친근하게, 예의가 필요한 상황은 공손하게.\n"
+            "추가 설명/따옴표/접두사 없이 번역문만 출력해."
         )
-    return "입력 문장을 자연스럽고 정확하게 번역해. 번역문만 답해."
-
-def translate_native(text: str, src: str, tgt: str) -> str:
-    system_prompt = build_system_prompt(src, tgt)
-    try:
-        resp = oai.chat.completions.create(
-            model=OPENAI_MODEL,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user",   "content": text},
-            ],
-            timeout=18,  # 빠른 응답
-        )
-        return (resp.choices[0].message.content or "").strip()
-    except Exception as e:
-        print("[OpenAI ERROR]", repr(e), file=sys.stderr)
-        return "번역 중 문제가 발생했어요. 잠시 후 다시 시도해주세요."
+    return "입력 문장을 자연스럽고 정확하게 번역해. 번역문만 출력해."
 
 def build_reply_label(src: str, tgt: str) -> str:
     if src == "ko" and tgt == "th":
@@ -196,6 +185,47 @@ def build_reply_label(src: str, tgt: str) -> str:
     if src == "th" and tgt == "ko":
         return "🇹🇭→🇰🇷"
     return ""
+
+# ===== 간단 문맥 메모리(최근 3문장) =====
+_context_mem: Dict[str, deque] = defaultdict(lambda: deque(maxlen=3))
+
+def _context_key(room_key: str, src: str, tgt: str) -> str:
+    return f"{room_key}:{src}->{tgt}"
+
+def _compose_messages(system_prompt: str, context_list: List[str], current: str) -> List[Dict[str, str]]:
+    msgs: List[Dict[str, str]] = [{"role": "system", "content": system_prompt}]
+    # 이전 맥락(최대 3개)을 사용자 발화로 붙여서, 연속 대화를 반영
+    for prev in context_list:
+        msgs.append({"role": "user", "content": prev})
+    msgs.append({"role": "user", "content": current})
+    return msgs
+
+def _chat_with_retry(messages: List[Dict[str, str]], max_retries: int = 2, timeout: int = 20) -> str:
+    """429/서버 일시 오류 시 짧게 재시도."""
+    delay = 0.6
+    for attempt in range(max_retries + 1):
+        try:
+            resp = oai.chat.completions.create(
+                model=OPENAI_MODEL,
+                messages=messages,
+                timeout=timeout,
+            )
+            return (resp.choices[0].message.content or "").strip()
+        except Exception as e:
+            if attempt < max_retries:
+                time.sleep(delay)
+                delay *= 1.5
+                continue
+            print("[OpenAI ERROR]", repr(e), file=sys.stderr)
+            return "번역 중 문제가 발생했어요. 잠시 후 다시 시도해주세요."
+
+def translate_native(room_key: str, text: str, src: str, tgt: str) -> str:
+    sys_prompt = build_system_prompt(src, tgt)
+    ckey = _context_key(room_key, src, tgt)
+    context_list = list(_context_mem[ckey])
+    _context_mem[ckey].append(text)
+    msgs = _compose_messages(sys_prompt, context_list, text)
+    return _chat_with_retry(msgs)
 
 # ===== Routes =====
 @app.route("/", methods=["GET"])
@@ -226,7 +256,12 @@ def on_message(event: MessageEvent):
     last_lang = _get_last_lang(key)
     detected = detect_lang(user_text, last_lang)
 
-    # 언어 결정 로직
+    # 이모지/반응만 온 경우: 안내문 출력하지 않고 원문 그대로 되돌려주기
+    if _looks_like_only_emoji_or_reaction(user_text):
+        _reply(event.reply_token, user_text)
+        return
+
+    # 언어 결정
     if detected == "ko":
         src, tgt = "ko", "th"
     elif detected == "th":
@@ -237,14 +272,17 @@ def on_message(event: MessageEvent):
             src = last_lang
             tgt = "th" if last_lang == "ko" else "ko"
         else:
-            _reply(event.reply_token,
-                   "지원 언어는 한국어/태국어입니다.\n한국어↔태국어 문장을 보내주세요.")
+            _reply(
+                event.reply_token,
+                "지원 언어는 한국어/태국어입니다.\n한국어↔태국어 문장을 보내주세요."
+            )
             return
 
     # 번역
-    out = translate_native(user_text, src, tgt)
+    out = translate_native(key, user_text, src, tgt)
     tag = build_reply_label(src, tgt)
-    _reply(event.reply_token, f"{tag}\n{out}")
+    reply_text = f"{tag}\n{out}" if tag else out
+    _reply(event.reply_token, reply_text)
 
     # 최근 언어 저장
     try:
