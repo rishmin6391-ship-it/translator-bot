@@ -11,7 +11,7 @@
 - LINE_CHANNEL_SECRET
 - LINE_CHANNEL_ACCESS_TOKEN
 - OPENAI_API_KEY
-- (선택) OPENAI_MODEL=Google Gemini API
+- (선택) OPENAI_MODEL=
 
 ## 3) 배포(Render)
 - 리포 업로드
