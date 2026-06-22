@@ -11,7 +11,7 @@
 - LINE_CHANNEL_SECRET
 - LINE_CHANNEL_ACCESS_TOKEN
 - OPENAI_API_KEY
-- (선택) OPENAI_MODEL=
+- (선택) OPENAI_MODEL=gpt-4o-mini
 
 ## 3) 배포(Render)
 - 리포 업로드
