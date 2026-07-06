@@ -5,7 +5,6 @@ import json
 import time
 import hashlib
 from typing import Optional, Dict, Any, List
-from collections import defaultdict, deque
 
 from flask import Flask, request, abort
 
@@ -26,8 +25,15 @@ app = Flask(__name__)
 LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN")
 LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o")     # 품질 우선
-CONSISTENCY_WINDOW_SEC = int(os.getenv("CONSISTENCY_WINDOW_SEC", "300"))  # 동일입력 캐시 유지(기본 5분)
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o")
+CONSISTENCY_WINDOW_SEC = int(os.getenv("CONSISTENCY_WINDOW_SEC", "300"))
+
+# 문맥 때문에 오역/역번역이 생길 수 있어 기본값은 OFF.
+# 정말 이전 문맥이 필요하면 Render 환경변수에 USE_TRANSLATION_CONTEXT=1 설정.
+USE_TRANSLATION_CONTEXT = os.getenv("USE_TRANSLATION_CONTEXT", "0") == "1"
+
+# 캐시 버전 변경: 예전 오역 캐시가 남아 있어도 다시 쓰지 않게 함.
+CACHE_VERSION = "v2_ko_th_en_emoji"
 
 if not (LINE_CHANNEL_ACCESS_TOKEN and LINE_CHANNEL_SECRET and OPENAI_API_KEY):
     print("[FATAL] Missing environment variables.", file=sys.stderr)
@@ -76,11 +82,10 @@ def _load_state():
                 _state_mem = json.load(f)
         else:
             _state_mem = {}
-        # 업그레이드 호환: 기본 구조 보장
-        _state_mem.setdefault("rooms", {})     # room_key -> { last_lang, context(list), cache(dict) }
+        _state_mem.setdefault("rooms", {})
         _loaded = True
         _last_flush = time.time()
-        print(f"[STATE] Loaded ok")
+        print("[STATE] Loaded ok")
     except Exception as e:
         print("[STATE] Load failed:", repr(e), file=sys.stderr)
         _state_mem = {"rooms": {}}
@@ -111,8 +116,8 @@ def _room_key(evt: MessageEvent) -> str:
 def _room(slot: str) -> Dict[str, Any]:
     r = _state_mem["rooms"].setdefault(slot, {})
     r.setdefault("last_lang", None)
-    r.setdefault("context", [])  # 최근 원문 queue
-    r.setdefault("cache", {})    # 입력 해시 -> {out, ts}
+    r.setdefault("context", [])
+    r.setdefault("cache", {})
     return r
 
 def _set_last_lang(slot: str, lang: str):
@@ -134,7 +139,7 @@ def _get_context(slot: str) -> List[str]:
 
 def _hash_key(slot: str, src: str, tgt: str, text: str) -> str:
     m = hashlib.sha256()
-    m.update((slot + "|" + src + ">" + tgt + "|" + text).encode("utf-8", errors="ignore"))
+    m.update((CACHE_VERSION + "|" + slot + "|" + src + ">" + tgt + "|" + text).encode("utf-8", errors="ignore"))
     return m.hexdigest()
 
 def _cache_get(slot: str, key: str) -> Optional[str]:
@@ -142,7 +147,7 @@ def _cache_get(slot: str, key: str) -> Optional[str]:
     item = cache.get(key)
     if not item:
         return None
-    # 시간 검사
+
     if time.time() - item.get("ts", 0) > CONSISTENCY_WINDOW_SEC:
         cache.pop(key, None)
         _flush_state()
@@ -152,7 +157,7 @@ def _cache_get(slot: str, key: str) -> Optional[str]:
 def _cache_put(slot: str, key: str, out: str):
     cache: Dict[str, Any] = _room(slot)["cache"]
     cache[key] = {"out": out, "ts": time.time()}
-    # 캐시 사이즈 제한(최근 200개)
+
     if len(cache) > 200:
         for k in list(cache.keys())[:-200]:
             cache.pop(k, None)
@@ -161,15 +166,25 @@ def _cache_put(slot: str, key: str, out: str):
 # ===== detectors =====
 RE_THAI   = re.compile(r"[\u0E00-\u0E7F]")
 RE_HANGUL = re.compile(r"[\u1100-\u11FF\u3130-\u318F\uAC00-\uD7A3]")
+RE_LATIN  = re.compile(r"[A-Za-z]")
+
+# 최신 유니코드 이모지 범위를 넓게 포함.
 EMOJI_REGEX = re.compile(
-    r"["
-    r"\U0001F600-\U0001F64F"
-    r"\U0001F300-\U0001F5FF"
-    r"\U0001F680-\U0001F6FF"
-    r"\U0001F1E0-\U0001F1FF"
-    r"]+",
+    r"(?:"
+    r"[\U0001F1E6-\U0001F1FF]{2}|"          # flags
+    r"[\U0001F300-\U0001F5FF]|"
+    r"[\U0001F600-\U0001F64F]|"
+    r"[\U0001F680-\U0001F6FF]|"
+    r"[\U0001F700-\U0001F77F]|"
+    r"[\U0001F780-\U0001F7FF]|"
+    r"[\U0001F800-\U0001F8FF]|"
+    r"[\U0001F900-\U0001F9FF]|"
+    r"[\U0001FA70-\U0001FAFF]|"
+    r"[\u2600-\u27BF]"
+    r")(?:[\uFE0F\u200D][\U0001F300-\U0001FAFF\u2600-\u27BF])*",
     flags=re.UNICODE
 )
+
 KOREAN_REACTIONS = re.compile(r"^(ㅋ+|ㅎ+|ㅠ+|ㅜ+|ㄷㄷ|ㅇㅇ|ㄴㄴ|\^\^|넵|넹|ㅇㅋ)$")
 THAI_REACTIONS   = re.compile(r"^(5{2,}|555+|คริ+|คิคิ+|ฮ่า+)$")
 
@@ -177,49 +192,96 @@ def _looks_like_only_emoji_or_reaction(text: str) -> bool:
     s = text.strip()
     if not s:
         return True
-    if EMOJI_REGEX.fullmatch(s):
+
+    # 이모지, 공백, 기호만 있으면 그대로 반환
+    without_emoji = EMOJI_REGEX.sub("", s).strip()
+    if without_emoji == "":
         return True
+
     if KOREAN_REACTIONS.fullmatch(s) or THAI_REACTIONS.fullmatch(s):
         return True
     return False
 
+def _first_script(text: str) -> Optional[str]:
+    """한국어/태국어가 섞인 경우 먼저 등장하는 문자 기준."""
+    for ch in text:
+        if RE_HANGUL.match(ch):
+            return "ko"
+        if RE_THAI.match(ch):
+            return "th"
+    return None
+
 def detect_lang(text: str, last_lang: Optional[str]) -> Optional[str]:
-    if RE_THAI.search(text):
-        return "th"
-    if RE_HANGUL.search(text):
+    has_ko = bool(RE_HANGUL.search(text))
+    has_th = bool(RE_THAI.search(text))
+    has_en = bool(RE_LATIN.search(text))
+
+    if has_ko and not has_th:
         return "ko"
-    if KOREAN_REACTIONS.search(text):
-        return last_lang or "ko"
-    if THAI_REACTIONS.search(text):
-        return last_lang or "th"
-    if EMOJI_REGEX.search(text):
-        return last_lang
+    if has_th and not has_ko:
+        return "th"
+    if has_ko and has_th:
+        return _first_script(text) or last_lang
+
+    # 영어만 입력하면 번역하지 않고 영어 그대로 출력하기 위한 처리
+    if has_en:
+        return "en"
+
+    if KOREAN_REACTIONS.fullmatch(text.strip()) or THAI_REACTIONS.fullmatch(text.strip()):
+        return "echo"
+    if _looks_like_only_emoji_or_reaction(text):
+        return "echo"
+
     return None
 
 # ===== prompts =====
 STRICT_KO_TH = (
-    "역할: 전문 통역사(한→태)\n"
-    "규칙:\n"
-    "1) 의미 보존(추가/삭제/각색 금지), 2) 고유명사/숫자 보존, 3) 자연스러운 태국어 구어체\n"
-    "4) 존댓말·반말 등 어감을 유지하되 태국어 문맥에 맞게만 최소한으로 조정\n"
-    "5) 번역문만 출력(설명/따옴표/접두사 금지)\n"
+    "You are a professional Korean to Thai translator for LINE chat.\n"
+    "Translate ONLY the user's latest message from Korean to natural Thai.\n"
+    "Rules:\n"
+    "1) Output only the Thai translation. Do not explain. Do not add labels or quotes.\n"
+    "2) Never answer in Korean. If Korean appears in the output, it is a failure.\n"
+    "3) Preserve meaning exactly. Do not add, omit, summarize, or reinterpret.\n"
+    "4) Preserve numbers, dates, names, URLs, product names, and English words as-is unless they clearly need Thai localization.\n"
+    "5) Preserve emojis, emoticons, punctuation mood, and line breaks as much as possible.\n"
+    "6) Keep the tone: casual, polite, angry, friendly, formal, etc.\n"
 )
 
 STRICT_TH_KO = (
-    "역할: 전문 통역사(태→한)\n"
-    "규칙:\n"
-    "1) 의미 보존(추가/삭제/각색 금지), 2) 고유명사/숫자 보존, 3) 자연스러운 한국어 구어체\n"
-    "4) 태국식 직역 피하고 한국어 문맥에 맞게만 최소한으로 조정\n"
-    "5) 번역문만 출력(설명/따옴표/접두사 금지)\n"
+    "You are a professional Thai to Korean translator for LINE chat.\n"
+    "Translate ONLY the user's latest message from Thai to natural Korean.\n"
+    "Rules:\n"
+    "1) Output only the Korean translation. Do not explain. Do not add labels or quotes.\n"
+    "2) Never answer in Thai. If Thai appears in the output, it is a failure.\n"
+    "3) Preserve meaning exactly. Do not add, omit, summarize, or reinterpret.\n"
+    "4) Preserve numbers, dates, names, URLs, product names, and English words as-is unless they clearly need Korean localization.\n"
+    "5) Preserve emojis, emoticons, punctuation mood, and line breaks as much as possible.\n"
+    "6) Keep the tone: casual, polite, angry, friendly, formal, etc.\n"
 )
 
 def system_prompt(src: str, tgt: str) -> str:
-    return STRICT_KO_TH if (src, tgt) == ("ko","th") else STRICT_TH_KO
+    if (src, tgt) == ("ko", "th"):
+        return STRICT_KO_TH
+    if (src, tgt) == ("th", "ko"):
+        return STRICT_TH_KO
+    return "Return the user's message as-is."
 
 def _compose_messages(sys_prompt: str, ctx: List[str], current: str) -> List[Dict[str, str]]:
     msgs: List[Dict[str, str]] = [{"role": "system", "content": sys_prompt}]
-    for prev in ctx[-5:]:  # 최근 5개까지만
-        msgs.append({"role": "user", "content": prev})
+
+    # 기존 코드처럼 이전 문장을 user 메시지로 계속 넣으면,
+    # 모델이 이전 문장까지 번역하거나 방향을 헷갈려 한국어로 답하는 일이 생길 수 있음.
+    if USE_TRANSLATION_CONTEXT and ctx:
+        context_text = "\n".join(ctx[-5:])
+        msgs.append({
+            "role": "system",
+            "content": (
+                "Reference context only. Do not translate the context. "
+                "Translate only the latest user message.\n"
+                f"{context_text}"
+            )
+        })
+
     msgs.append({"role": "user", "content": current})
     return msgs
 
@@ -227,7 +289,7 @@ def _chat_once(messages: List[Dict[str, str]], timeout: int = 18) -> str:
     resp = oai.chat.completions.create(
         model=OPENAI_MODEL,
         messages=messages,
-        temperature=0.0,         # 결정론 강화
+        temperature=0.0,
         top_p=1.0,
         presence_penalty=0,
         frequency_penalty=0,
@@ -235,22 +297,57 @@ def _chat_once(messages: List[Dict[str, str]], timeout: int = 18) -> str:
     )
     return (resp.choices[0].message.content or "").strip()
 
+def _has_wrong_script(src: str, tgt: str, out: str) -> bool:
+    if tgt == "th" and RE_HANGUL.search(out):
+        return True
+    if tgt == "ko" and RE_THAI.search(out):
+        return True
+    return False
+
+def _restore_missing_emojis(inp: str, out: str) -> str:
+    """모델이 이모지를 빠뜨렸을 때 최소한 누락 이모지를 끝에 복원."""
+    in_emojis = EMOJI_REGEX.findall(inp)
+    if not in_emojis:
+        return out
+
+    fixed = out
+    for emoji in in_emojis:
+        if emoji not in fixed:
+            fixed += emoji
+    return fixed
+
 def _guard_retry(slot: str, src: str, tgt: str, inp: str, out: str) -> str:
-    """산출 길이가 입력 대비 과도하게 짧거나 길면 보수 프롬프트로 1회 재시도."""
+    """길이 이상 또는 역언어 출력이면 엄격 프롬프트로 1회 재시도."""
     li, lo = len(inp), len(out)
+    should_retry = False
+
+    if _has_wrong_script(src, tgt, out):
+        should_retry = True
+
     if li >= 8:
-        if lo < max(3, int(li*0.25)) or lo > int(li*2.5):
-            sys_p = system_prompt(src, tgt) + "\n추가 규칙: 원문 의미를 절대 바꾸지 말고, 길이감도 과도하게 바뀌지 않게 하라."
-            msgs = _compose_messages(sys_p, _get_context(slot), inp)
-            try:
-                return _chat_once(msgs, timeout=18)
-            except Exception as e:
-                print("[OpenAI RETRY ERROR]", repr(e), file=sys.stderr)
-                return out
+        if lo < max(3, int(li * 0.20)) or lo > int(li * 3.0):
+            should_retry = True
+
+    if not should_retry:
+        return out
+
+    sys_p = (
+        system_prompt(src, tgt)
+        + "\nCritical correction: Your previous output used the wrong language or changed the length too much. "
+          "Translate the latest message again into the target language only."
+    )
+    msgs = _compose_messages(sys_p, _get_context(slot), inp)
+
+    try:
+        retry_out = _chat_once(msgs, timeout=18)
+        if retry_out:
+            return retry_out
+    except Exception as e:
+        print("[OpenAI RETRY ERROR]", repr(e), file=sys.stderr)
+
     return out
 
 def translate(slot: str, text: str, src: str, tgt: str) -> str:
-    # 캐시: 동일 입력은 CONSISTENCY_WINDOW_SEC 내 동일 결과 반환
     key = _hash_key(slot, src, tgt, text)
     cached = _cache_get(slot, key)
     if cached is not None:
@@ -263,6 +360,7 @@ def translate(slot: str, text: str, src: str, tgt: str) -> str:
     try:
         out = _chat_once(msgs)
         out = _guard_retry(slot, src, tgt, text, out)
+        out = _restore_missing_emojis(text, out)
     except Exception as e:
         print("[OpenAI ERROR]", repr(e), file=sys.stderr)
         out = "번역 중 문제가 발생했어요. 잠시 후 다시 시도해주세요."
@@ -297,28 +395,24 @@ def on_message(event: MessageEvent):
     text = (event.message.text or "").strip()
     app.logger.info("[MESSAGE] %s | %s", slot, text)
 
-    # 이모지/반응만 오면 그대로 되돌려줌(안내문 방지)
-    if _looks_like_only_emoji_or_reaction(text):
+    detected = detect_lang(text, _get_last_lang(slot))
+
+    # 이모지/리액션/숫자/기호/영어만 입력하면 그대로 출력
+    # 예: 😂 / ㅋㅋㅋ / OK / Thank you / 010-0000-0000
+    if detected in {"echo", "en"} or detected is None:
         _reply(event.reply_token, text)
         return
-
-    last_lang = _get_last_lang(slot)
-    detected = detect_lang(text, last_lang)
 
     if detected == "ko":
         src, tgt = "ko", "th"
     elif detected == "th":
         src, tgt = "th", "ko"
     else:
-        if last_lang in {"ko", "th"}:
-            src = last_lang
-            tgt = "th" if last_lang == "ko" else "ko"
-        else:
-            _reply(event.reply_token, "지원 언어는 한국어/태국어입니다.\n한국어↔태국어 문장을 보내주세요.")
-            return
+        _reply(event.reply_token, text)
+        return
 
     out = translate(slot, text, src, tgt)
-    label = "🇰🇷→🇹🇭" if src=="ko" else "🇹🇭→🇰🇷"
+    label = "🇰🇷→🇹🇭" if src == "ko" else "🇹🇭→🇰🇷"
     _reply(event.reply_token, f"{label}\n{out}")
 
     try:
