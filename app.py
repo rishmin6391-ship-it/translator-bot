@@ -43,8 +43,8 @@ USE_TRANSLATION_CONTEXT = os.getenv("USE_TRANSLATION_CONTEXT", "1") == "1"
 CONTEXT_MAXLEN = max(0, min(3, int(os.getenv("TRANSLATION_CONTEXT_MESSAGES", "2"))))
 
 # 예전 캐시/문맥과 섞이지 않도록 버전 갱신.
-STATE_VERSION = "v4_native_gendered_translation"
-CACHE_VERSION = "v4_native_gendered_translation"
+STATE_VERSION = "v5_native_line_translation"
+CACHE_VERSION = "v5_native_line_translation"
 
 if not (LINE_CHANNEL_ACCESS_TOKEN and LINE_CHANNEL_SECRET and OPENAI_API_KEY):
     print("[FATAL] Missing environment variables.", file=sys.stderr)
@@ -343,8 +343,8 @@ The Korean speaker is MALE.
 
 Native Thai style rules:
 - Write modern, natural Thai used by a Thai native in LINE/chat.
-- When first-person reference is actually needed, use a natural male form such as ผม according to the source register; do not insert ผม repeatedly when Thai naturally omits it.
-- For polite Korean endings such as -요/-습니다, use male Thai politeness such as ครับ naturally where appropriate.
+- Thai chat naturally omits pronouns. Do not add ผม unless the meaning requires a clear first-person subject.
+- Use ครับ only when a Thai male speaker would naturally use it. Do not attach ครับ to every polite Korean sentence.
 - For Korean casual speech/반말, do NOT mechanically append ครับ to every sentence; keep it naturally casual while still making the speaker male.
 - Never use female-speaker polite endings such as ค่ะ / คะ / นะคะ for the Korean male speaker unless they are explicitly quoted text in the source.
 - Translate Korean idioms/slang by meaning into the closest natural Thai chat expression instead of literal Korean-shaped Thai.
@@ -363,6 +363,9 @@ Native Korean style rules:
 - Thai kinship/relationship terms such as พี่/น้อง must be translated from context. If gender or relationship is unclear, do not guess a specific Korean role such as 오빠/언니/형/누나 without support.
 - If พี่ clearly refers to an older male partner/person from a female speaker's context, 오빠 can be natural; otherwise preserve the least-assumptive natural meaning.
 - Translate Thai idioms, particles, and chat slang by their conversational meaning, not word-for-word.
+- For LINE conversations between close friends or couples, prefer natural Korean casual speech when the Thai source is casual.
+- Do not automatically translate Thai politeness particles (ค่ะ, ครับ, นะคะ) into Korean honorific endings.
+- Preserve emotional tone more than grammatical politeness.
 """.strip()
 
 
@@ -507,14 +510,13 @@ def _needs_retry(src: str, tgt: str, inp: str, out: str) -> bool:
     if _looks_like_meta_answer(out):
         return True
 
-    # 비정상적으로 짧거나 긴 결과만 잡는다.
-    # 한국어↔태국어는 문자 길이 비율 차이가 있어 범위를 넓게 둔다.
+    # 너무 짧거나 비정상적으로 긴 결과만 검사한다.
+    # 한국어↔태국어는 자연스러운 길이 차이가 커서 비율 검사를 사용하지 않는다.
     li, lo = len(inp.strip()), len(out.strip())
-    if li >= 12:
-        if lo < max(2, int(li * 0.16)):
-            return True
-        if lo > max(80, int(li * 4.2)):
-            return True
+    if li >= 20 and lo < 2:
+        return True
+    if lo > 250:
+        return True
 
     return False
 
@@ -555,7 +557,25 @@ def translate(slot: str, text: str, src: str, tgt: str) -> str:
 
     except Exception as e:
         print("[OpenAI ERROR]", repr(e), file=sys.stderr)
-        return "번역 중 문제가 발생했어요. 잠시 후 다시 시도해주세요."
+
+        # 일시적인 API 오류나 검증 실패 시 사용자에게 오류 문구를 보내지 않고
+        # 한 번 더 자연 번역을 시도한다.
+        try:
+            retry = _translate_once(
+                system_prompt(src, tgt, correction=True),
+                payload,
+                OPENAI_RETRY_MODEL,
+            )
+            if retry.strip():
+                retry = _restore_missing_emojis(text, retry.strip())
+                _cache_put(slot, key, retry)
+                _push_context(slot, src, text)
+                return retry
+        except Exception as e2:
+            print("[RETRY ERROR]", repr(e2), file=sys.stderr)
+
+        # 최악의 경우 오류 메시지 대신 원문을 유지한다.
+        return text
 
 
 # ===== routes =====
