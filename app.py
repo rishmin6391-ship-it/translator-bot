@@ -26,25 +26,23 @@ LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN")
 LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
-# 번역 품질 우선 설정.
-# - 1차 번역: gpt-5.6-terra (속도/비용 균형)
-# - 재번역/의미 검수: gpt-5.6-sol (정확도 우선)
-# 비용을 줄이려면 Render 환경변수에서 REVIEW_TRANSLATION=0 으로 끌 수 있다.
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5.6-terra")
-OPENAI_RETRY_MODEL = os.getenv("OPENAI_RETRY_MODEL", "gpt-5.6-sol")
-OPENAI_REVIEW_MODEL = os.getenv("OPENAI_REVIEW_MODEL", "gpt-5.6-sol")
-# 응급 fallback 모델. 1차/재번역 모델이 일시적으로 실패했을 때만 사용한다.
-OPENAI_COMPAT_MODEL = os.getenv("OPENAI_COMPAT_MODEL", "gpt-4o")
-OPENAI_EMERGENCY_MODEL = os.getenv("OPENAI_EMERGENCY_MODEL", OPENAI_COMPAT_MODEL)
+# ===== Translation model settings =====
+# IMPORTANT:
+# 예전 Render 환경변수 OPENAI_MODEL / OPENAI_RETRY_MODEL / OPENAI_COMPAT_MODEL은
+# 의도적으로 사용하지 않는다. 이전 배포에서 잘못된/구형 모델명이 남아 있어도
+# 새 코드의 모델 선택을 덮어쓰지 못하게 하기 위함이다.
+# 필요할 때만 KIRA_* 변수로 새 모델을 지정한다.
+KIRA_PRIMARY_MODEL = os.getenv("KIRA_PRIMARY_MODEL", "gpt-6-luna")
+KIRA_FALLBACK_MODEL = os.getenv("KIRA_FALLBACK_MODEL", "gpt-4.1-mini")
+KIRA_EMERGENCY_MODEL = os.getenv("KIRA_EMERGENCY_MODEL", "gpt-4o-mini")
+KIRA_REVIEW_MODEL = os.getenv("KIRA_REVIEW_MODEL", KIRA_FALLBACK_MODEL)
 
-# LINE reply_token이 오래 기다리다 만료되지 않도록 각 단계의 timeout을 짧게 제한한다.
-# 총 3단계(1차 → 재번역 → 응급 fallback)로 처리하므로 일반적인 일시 오류는
-# 사용자에게 "번역 실패"를 보여주기 전에 한 번 더 우회할 수 있다.
-OPENAI_TIMEOUT_SEC = float(os.getenv("OPENAI_TIMEOUT_SEC", "8"))
-OPENAI_RETRY_TIMEOUT_SEC = float(os.getenv("OPENAI_RETRY_TIMEOUT_SEC", "8"))
-OPENAI_EMERGENCY_TIMEOUT_SEC = float(os.getenv("OPENAI_EMERGENCY_TIMEOUT_SEC", "6"))
+# LINE reply_token이 오래 기다리다 만료되지 않도록 단계별 timeout을 짧게 둔다.
+# 정상 상황에서는 1차 호출 한 번만 실행되므로 속도 저하는 없다.
+OPENAI_TIMEOUT_SEC = float(os.getenv("OPENAI_TIMEOUT_SEC", "6"))
+OPENAI_RETRY_TIMEOUT_SEC = float(os.getenv("OPENAI_RETRY_TIMEOUT_SEC", "6"))
+OPENAI_EMERGENCY_TIMEOUT_SEC = float(os.getenv("OPENAI_EMERGENCY_TIMEOUT_SEC", "5"))
 
-OPENAI_REASONING_EFFORT = os.getenv("OPENAI_REASONING_EFFORT", "none")
 REVIEW_TRANSLATION = os.getenv("REVIEW_TRANSLATION", "0") == "1"
 OPENAI_MAX_OUTPUT_TOKENS = int(os.getenv("OPENAI_MAX_OUTPUT_TOKENS", "400"))
 CONSISTENCY_WINDOW_SEC = int(os.getenv("CONSISTENCY_WINDOW_SEC", "300"))
@@ -55,8 +53,8 @@ USE_TRANSLATION_CONTEXT = os.getenv("USE_TRANSLATION_CONTEXT", "1") == "1"
 CONTEXT_MAXLEN = max(0, min(3, int(os.getenv("TRANSLATION_CONTEXT_MESSAGES", "2"))))
 
 # 예전 캐시/문맥과 섞이지 않도록 버전 갱신.
-STATE_VERSION = "v8_no_fail_translation"
-CACHE_VERSION = "v8_no_fail_translation"
+STATE_VERSION = "v9_model_safe_translation"
+CACHE_VERSION = "v9_model_safe_translation"
 
 if not (LINE_CHANNEL_ACCESS_TOKEN and LINE_CHANNEL_SECRET and OPENAI_API_KEY):
     print("[FATAL] Missing environment variables.", file=sys.stderr)
@@ -476,37 +474,40 @@ def _build_review_payload(
     )
 
 
+def _extract_responses_text(resp: Any) -> str:
+    """SDK 버전에 따라 output_text 편의 속성이 없어도 실제 텍스트를 꺼낸다."""
+    direct = (getattr(resp, "output_text", "") or "").strip()
+    if direct:
+        return direct
+
+    chunks: List[str] = []
+    for item in (getattr(resp, "output", None) or []):
+        for content in (getattr(item, "content", None) or []):
+            text_value = getattr(content, "text", None)
+            if isinstance(text_value, str) and text_value.strip():
+                chunks.append(text_value.strip())
+            elif isinstance(content, dict):
+                value = content.get("text")
+                if isinstance(value, str) and value.strip():
+                    chunks.append(value.strip())
+    return "\n".join(chunks).strip()
+
+
 def _responses_once(
     instructions: str,
     payload: str,
     model: str,
     timeout: float = OPENAI_TIMEOUT_SEC,
 ) -> str:
-    """Responses API 1회 호출. reasoning 옵션 비호환 시 즉시 옵션 없이 재호출."""
-    kwargs: Dict[str, Any] = {
-        "model": model,
-        "instructions": instructions,
-        "input": payload,
-        "max_output_tokens": OPENAI_MAX_OUTPUT_TOKENS,
-        "timeout": timeout,
-    }
-
-    if model.startswith(("gpt-5", "gpt-6")) and OPENAI_REASONING_EFFORT:
-        kwargs["reasoning"] = {"effort": OPENAI_REASONING_EFFORT}
-
-    try:
-        resp = oai.responses.create(**kwargs)
-    except Exception as e:
-        # SDK/모델 조합에 따라 reasoning='none' 또는 reasoning 자체를
-        # 지원하지 않는 경우가 있어, 그 경우에만 reasoning을 제거해 즉시 재호출한다.
-        msg = str(e).lower()
-        if isinstance(e, TypeError) or "reasoning" in msg or "effort" in msg:
-            kwargs.pop("reasoning", None)
-            resp = oai.responses.create(**kwargs)
-        else:
-            raise
-
-    return (getattr(resp, "output_text", "") or "").strip()
+    """Responses API를 단순한 텍스트 번역 호출로 사용한다."""
+    resp = oai.responses.create(
+        model=model,
+        instructions=instructions,
+        input=payload,
+        max_output_tokens=OPENAI_MAX_OUTPUT_TOKENS,
+        timeout=timeout,
+    )
+    return _extract_responses_text(resp)
 
 
 def _chat_compat_once(
@@ -515,13 +516,14 @@ def _chat_compat_once(
     model: str,
     timeout: float = OPENAI_TIMEOUT_SEC,
 ) -> str:
-    """구버전 OpenAI SDK 호환용 fallback."""
+    """Responses 경로가 실패할 때 쓰는 독립적인 Chat Completions fallback."""
     resp = oai.chat.completions.create(
         model=model,
         messages=[
             {"role": "system", "content": instructions},
             {"role": "user", "content": payload},
         ],
+        max_tokens=OPENAI_MAX_OUTPUT_TOKENS,
         timeout=timeout,
     )
     return (resp.choices[0].message.content or "").strip()
@@ -533,12 +535,17 @@ def _translate_once(
     model: str,
     timeout: float = OPENAI_TIMEOUT_SEC,
 ) -> str:
-    # 기본 경로는 Responses API.
+    # 최신 SDK는 Responses API를 우선 사용한다.
     if hasattr(oai, "responses"):
         return _responses_once(instructions, payload, model, timeout)
 
-    # 아주 오래된 SDK에서만 Chat Completions 사용.
-    return _chat_compat_once(instructions, payload, OPENAI_COMPAT_MODEL, timeout)
+    # 오래된 SDK라 Responses API가 없으면 널리 호환되는 fallback 모델을 사용한다.
+    return _chat_compat_once(
+        instructions,
+        payload,
+        KIRA_FALLBACK_MODEL,
+        timeout,
+    )
 
 
 def _emergency_translate_once(
@@ -546,15 +553,11 @@ def _emergency_translate_once(
     payload: str,
     timeout: float = OPENAI_EMERGENCY_TIMEOUT_SEC,
 ) -> str:
-    """
-    1차/재번역이 모두 실패했을 때 쓰는 마지막 우회 경로.
-    Responses API와 다른 코드 경로(Chat Completions)를 사용해
-    일시적 Responses 오류/모델 오류까지 함께 우회한다.
-    """
+    """Responses API와 별개의 Chat Completions 경로로 마지막 한 번 우회한다."""
     return _chat_compat_once(
         instructions,
         payload,
-        OPENAI_EMERGENCY_MODEL,
+        KIRA_EMERGENCY_MODEL,
         timeout,
     )
 
@@ -731,7 +734,7 @@ def _review_translation(
         reviewed = _translate_once(
             review_prompt(src, tgt),
             payload,
-            OPENAI_REVIEW_MODEL,
+            KIRA_REVIEW_MODEL,
             OPENAI_RETRY_TIMEOUT_SEC,
         ).strip()
         reviewed = _clean_translation_candidate(text, reviewed)
@@ -765,7 +768,7 @@ def translate(slot: str, text: str, src: str, tgt: str) -> str:
         first = _translate_once(
             system_prompt(src, tgt),
             payload,
-            OPENAI_MODEL,
+            KIRA_PRIMARY_MODEL,
             OPENAI_TIMEOUT_SEC,
         ).strip()
         first = _clean_translation_candidate(text, first)
@@ -780,7 +783,7 @@ def translate(slot: str, text: str, src: str, tgt: str) -> str:
             retry = _translate_once(
                 system_prompt(src, tgt, correction=True),
                 payload,
-                OPENAI_RETRY_MODEL,
+                KIRA_FALLBACK_MODEL,
                 OPENAI_RETRY_TIMEOUT_SEC,
             ).strip()
             retry = _clean_translation_candidate(text, retry)
@@ -853,7 +856,18 @@ def translate(slot: str, text: str, src: str, tgt: str) -> str:
 # ===== routes =====
 @app.route("/", methods=["GET"])
 def home():
-    return "OK", 200
+    return "Kira Translator v9 OK", 200
+
+
+@app.route("/health", methods=["GET"])
+def health():
+    return {
+        "status": "ok",
+        "version": STATE_VERSION,
+        "primary_model": KIRA_PRIMARY_MODEL,
+        "fallback_model": KIRA_FALLBACK_MODEL,
+        "emergency_model": KIRA_EMERGENCY_MODEL,
+    }, 200
 
 
 @app.route("/callback", methods=["POST"])
