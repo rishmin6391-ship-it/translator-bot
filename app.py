@@ -33,10 +33,17 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5.6-terra")
 OPENAI_RETRY_MODEL = os.getenv("OPENAI_RETRY_MODEL", "gpt-5.6-sol")
 OPENAI_REVIEW_MODEL = os.getenv("OPENAI_REVIEW_MODEL", "gpt-5.6-sol")
-# 아주 오래된 OpenAI SDK에서 Responses API가 없을 때만 사용하는 호환 모델.
+# 응급 fallback 모델. 1차/재번역 모델이 일시적으로 실패했을 때만 사용한다.
 OPENAI_COMPAT_MODEL = os.getenv("OPENAI_COMPAT_MODEL", "gpt-4o")
+OPENAI_EMERGENCY_MODEL = os.getenv("OPENAI_EMERGENCY_MODEL", OPENAI_COMPAT_MODEL)
 
-OPENAI_TIMEOUT_SEC = float(os.getenv("OPENAI_TIMEOUT_SEC", "20"))
+# LINE reply_token이 오래 기다리다 만료되지 않도록 각 단계의 timeout을 짧게 제한한다.
+# 총 3단계(1차 → 재번역 → 응급 fallback)로 처리하므로 일반적인 일시 오류는
+# 사용자에게 "번역 실패"를 보여주기 전에 한 번 더 우회할 수 있다.
+OPENAI_TIMEOUT_SEC = float(os.getenv("OPENAI_TIMEOUT_SEC", "8"))
+OPENAI_RETRY_TIMEOUT_SEC = float(os.getenv("OPENAI_RETRY_TIMEOUT_SEC", "8"))
+OPENAI_EMERGENCY_TIMEOUT_SEC = float(os.getenv("OPENAI_EMERGENCY_TIMEOUT_SEC", "6"))
+
 OPENAI_REASONING_EFFORT = os.getenv("OPENAI_REASONING_EFFORT", "none")
 REVIEW_TRANSLATION = os.getenv("REVIEW_TRANSLATION", "0") == "1"
 OPENAI_MAX_OUTPUT_TOKENS = int(os.getenv("OPENAI_MAX_OUTPUT_TOKENS", "400"))
@@ -48,8 +55,8 @@ USE_TRANSLATION_CONTEXT = os.getenv("USE_TRANSLATION_CONTEXT", "1") == "1"
 CONTEXT_MAXLEN = max(0, min(3, int(os.getenv("TRANSLATION_CONTEXT_MESSAGES", "2"))))
 
 # 예전 캐시/문맥과 섞이지 않도록 버전 갱신.
-STATE_VERSION = "v7_fast_robust_translation"
-CACHE_VERSION = "v7_fast_robust_translation"
+STATE_VERSION = "v8_no_fail_translation"
+CACHE_VERSION = "v8_no_fail_translation"
 
 if not (LINE_CHANNEL_ACCESS_TOKEN and LINE_CHANNEL_SECRET and OPENAI_API_KEY):
     print("[FATAL] Missing environment variables.", file=sys.stderr)
@@ -83,7 +90,10 @@ print(f"[STATE] Using state dir: {STATE_DIR}")
 # ===== Clients =====
 line_config = Configuration(access_token=LINE_CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(LINE_CHANNEL_SECRET)
-oai = OpenAI(api_key=OPENAI_API_KEY)
+
+# SDK 내부 자동 재시도는 오래 지연될 수 있으므로 끄고,
+# 아래 translate()에서 모델별 fallback 순서를 직접 제어한다.
+oai = OpenAI(api_key=OPENAI_API_KEY, max_retries=0)
 
 # ===== In-memory state =====
 _state_mem: Dict[str, Any] = {}
@@ -472,7 +482,7 @@ def _responses_once(
     model: str,
     timeout: float = OPENAI_TIMEOUT_SEC,
 ) -> str:
-    """최신 SDK의 Responses API 사용. 추론을 끄고 번역만 빠르게 수행."""
+    """Responses API 1회 호출. reasoning 옵션 비호환 시 즉시 옵션 없이 재호출."""
     kwargs: Dict[str, Any] = {
         "model": model,
         "instructions": instructions,
@@ -481,16 +491,21 @@ def _responses_once(
         "timeout": timeout,
     }
 
-    # 번역은 긴 추론이 필요하지 않지만, low 정도를 주면 의미 보존이 더 안정적이다.
-    if model.startswith(("gpt-5", "gpt-6")):
+    if model.startswith(("gpt-5", "gpt-6")) and OPENAI_REASONING_EFFORT:
         kwargs["reasoning"] = {"effort": OPENAI_REASONING_EFFORT}
 
     try:
         resp = oai.responses.create(**kwargs)
-    except TypeError:
-        # 일부 구버전 SDK가 reasoning 인자를 모를 수 있으므로 한 번만 제거 후 호환 시도.
-        kwargs.pop("reasoning", None)
-        resp = oai.responses.create(**kwargs)
+    except Exception as e:
+        # SDK/모델 조합에 따라 reasoning='none' 또는 reasoning 자체를
+        # 지원하지 않는 경우가 있어, 그 경우에만 reasoning을 제거해 즉시 재호출한다.
+        msg = str(e).lower()
+        if isinstance(e, TypeError) or "reasoning" in msg or "effort" in msg:
+            kwargs.pop("reasoning", None)
+            resp = oai.responses.create(**kwargs)
+        else:
+            raise
+
     return (getattr(resp, "output_text", "") or "").strip()
 
 
@@ -518,10 +533,30 @@ def _translate_once(
     model: str,
     timeout: float = OPENAI_TIMEOUT_SEC,
 ) -> str:
-    # 최신 SDK에서는 Responses API. 아주 오래된 SDK라 responses가 없으면 기존 Chat API로 동작.
+    # 기본 경로는 Responses API.
     if hasattr(oai, "responses"):
         return _responses_once(instructions, payload, model, timeout)
+
+    # 아주 오래된 SDK에서만 Chat Completions 사용.
     return _chat_compat_once(instructions, payload, OPENAI_COMPAT_MODEL, timeout)
+
+
+def _emergency_translate_once(
+    instructions: str,
+    payload: str,
+    timeout: float = OPENAI_EMERGENCY_TIMEOUT_SEC,
+) -> str:
+    """
+    1차/재번역이 모두 실패했을 때 쓰는 마지막 우회 경로.
+    Responses API와 다른 코드 경로(Chat Completions)를 사용해
+    일시적 Responses 오류/모델 오류까지 함께 우회한다.
+    """
+    return _chat_compat_once(
+        instructions,
+        payload,
+        OPENAI_EMERGENCY_MODEL,
+        timeout,
+    )
 
 
 def _has_wrong_script(tgt: str, out: str) -> bool:
@@ -658,6 +693,29 @@ def _needs_retry(src: str, tgt: str, inp: str, out: str) -> bool:
     return False
 
 
+def _safe_relaxed_candidate(src: str, tgt: str, inp: str, out: str) -> bool:
+    """
+    엄격 검사에서 길이 같은 휴리스틱 때문에 걸렸더라도 실제 번역으로 사용 가능한지 확인.
+    숫자/시간/URL 누락, 잘못된 언어, 성별 종결어, 원문 그대로 출력 같은 위험은 허용하지 않는다.
+    """
+    out = _clean_translation_candidate(inp, out)
+    if not out:
+        return False
+    if _same_as_source(inp, out):
+        return False
+    if not _has_target_script(tgt, out):
+        return False
+    if _has_wrong_script(tgt, out):
+        return False
+    if _has_wrong_speaker_gender(src, tgt, out):
+        return False
+    if _looks_like_meta_answer(out):
+        return False
+    if _missing_protected_token(inp, out):
+        return False
+    return True
+
+
 def _review_translation(
     ctx: List[Dict[str, str]],
     text: str,
@@ -674,6 +732,7 @@ def _review_translation(
             review_prompt(src, tgt),
             payload,
             OPENAI_REVIEW_MODEL,
+            OPENAI_RETRY_TIMEOUT_SEC,
         ).strip()
         reviewed = _clean_translation_candidate(text, reviewed)
         if reviewed and not _needs_retry(src, tgt, text, reviewed):
@@ -701,22 +760,28 @@ def translate(slot: str, text: str, src: str, tgt: str) -> str:
     payload = _build_payload(ctx, text)
     candidates: List[str] = []
 
-    # 1차 번역
+    # 1) 빠른 1차 번역
     try:
-        first = _translate_once(system_prompt(src, tgt), payload, OPENAI_MODEL).strip()
+        first = _translate_once(
+            system_prompt(src, tgt),
+            payload,
+            OPENAI_MODEL,
+            OPENAI_TIMEOUT_SEC,
+        ).strip()
         first = _clean_translation_candidate(text, first)
         if first:
             candidates.append(first)
     except Exception as e:
         print("[OpenAI FIRST ERROR]", repr(e), file=sys.stderr)
 
-    # 1차 결과가 형식/언어/숫자 보존 검사에 실패하면 Sol로 원문부터 다시 번역한다.
+    # 2) 1차가 비었거나 검증 실패면 정확도 모델로 원문부터 재번역
     if not candidates or _needs_retry(src, tgt, text, candidates[-1]):
         try:
             retry = _translate_once(
                 system_prompt(src, tgt, correction=True),
                 payload,
                 OPENAI_RETRY_MODEL,
+                OPENAI_RETRY_TIMEOUT_SEC,
             ).strip()
             retry = _clean_translation_candidate(text, retry)
             if retry:
@@ -724,7 +789,27 @@ def translate(slot: str, text: str, src: str, tgt: str) -> str:
         except Exception as e:
             print("[OpenAI RETRY ERROR]", repr(e), file=sys.stderr)
 
-    # 뒤에서부터 정상 후보를 고른다. 잘못된 재시도 결과가 정상 1차 결과를 덮지 않게 한다.
+    # 3) 앞의 두 경로가 모두 실패/비정상이면 Chat Completions + 호환 모델로 마지막 우회.
+    #    서로 다른 API 경로를 사용하므로 일시적인 Responses 오류에도 더 강하다.
+    has_strict_valid = any(
+        not _needs_retry(src, tgt, text, c)
+        for c in candidates
+        if c
+    )
+    if not has_strict_valid:
+        try:
+            emergency = _emergency_translate_once(
+                system_prompt(src, tgt, correction=True),
+                payload,
+                OPENAI_EMERGENCY_TIMEOUT_SEC,
+            ).strip()
+            emergency = _clean_translation_candidate(text, emergency)
+            if emergency:
+                candidates.append(emergency)
+        except Exception as e:
+            print("[OpenAI EMERGENCY ERROR]", repr(e), file=sys.stderr)
+
+    # 가장 최근의 정상 후보를 우선 선택한다.
     out = ""
     for candidate in reversed(candidates):
         candidate = _clean_translation_candidate(text, candidate)
@@ -732,16 +817,12 @@ def translate(slot: str, text: str, src: str, tgt: str) -> str:
             out = candidate
             break
 
+    # 엄격 휴리스틱만 걸린 경우에도 실제로 안전한 번역이면 사용한다.
+    # 단, 숫자/시간/URL 누락 등 의미 손실 위험이 있으면 절대 통과시키지 않는다.
     if not out:
-        # 엄격 검증에 걸렸더라도, 원문과 다르고 목표 언어가 실제로 들어 있는 후보는
-        # 마지막 안전 후보로 사용한다. 짧은 정상 문장을 과도하게 실패 처리하는 것을 막는다.
         for candidate in reversed(candidates):
             candidate = _clean_translation_candidate(text, candidate)
-            if (
-                candidate
-                and not _same_as_source(text, candidate)
-                and _has_target_script(tgt, candidate)
-            ):
+            if _safe_relaxed_candidate(src, tgt, text, candidate):
                 out = candidate
                 break
 
@@ -749,13 +830,18 @@ def translate(slot: str, text: str, src: str, tgt: str) -> str:
         return _failure_message(tgt)
 
     out = _restore_missing_emojis(text, out.strip())
+    pre_review = out
 
-    # 의미 전달 검수: 원문과 초안을 함께 보고 누락/반대 의미/관계어/말투를 교정한다.
-    out = _review_translation(ctx, text, src, tgt, out)
-    out = _restore_missing_emojis(text, out.strip())
+    # 의미 전달 검수. 검수 API가 실패하더라도 이미 정상인 번역은 버리지 않는다.
+    reviewed = _review_translation(ctx, text, src, tgt, pre_review)
+    reviewed = _restore_missing_emojis(text, reviewed.strip())
 
-    # 검수 결과까지 마지막으로 안전 검사한다.
-    if _needs_retry(src, tgt, text, out):
+    if not _needs_retry(src, tgt, text, reviewed):
+        out = reviewed
+    elif _safe_relaxed_candidate(src, tgt, text, pre_review):
+        # 검수 결과가 오히려 비정상일 때는 정상 1차/재번역 결과로 되돌린다.
+        out = pre_review
+    else:
         return _failure_message(tgt)
 
     # 정상 번역만 캐시 및 대화 문맥에 저장한다.
