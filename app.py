@@ -1,113 +1,96 @@
-            if retry:
-                candidates.append(retry)
+import os
+import re
+import sys
+import json
+import time
+import hashlib
+from typing import Optional, Dict, Any, List
+
+from flask import Flask, request, abort
+
+# ===== LINE v3 SDK =====
+from linebot.v3.webhooks import MessageEvent, TextMessageContent
+from linebot.v3.webhook import WebhookHandler
+from linebot.v3.messaging import (
+    Configuration, ApiClient, MessagingApi,
+    ReplyMessageRequest, TextMessage
+)
+
+# ===== OpenAI =====
+from openai import OpenAI
+
+app = Flask(__name__)
+
+# ===== ENV =====
+LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN")
+LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+
+# 번역 품질 우선 설정.
+# - 1차 번역: gpt-5.6-terra (속도/비용 균형)
+# - 재번역/의미 검수: gpt-5.6-sol (정확도 우선)
+# 비용을 줄이려면 Render 환경변수에서 REVIEW_TRANSLATION=0 으로 끌 수 있다.
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5.6-terra")
+OPENAI_RETRY_MODEL = os.getenv("OPENAI_RETRY_MODEL", "gpt-5.6-sol")
+OPENAI_REVIEW_MODEL = os.getenv("OPENAI_REVIEW_MODEL", "gpt-5.6-sol")
+# 아주 오래된 OpenAI SDK에서 Responses API가 없을 때만 사용하는 호환 모델.
+OPENAI_COMPAT_MODEL = os.getenv("OPENAI_COMPAT_MODEL", "gpt-4o")
+
+OPENAI_TIMEOUT_SEC = float(os.getenv("OPENAI_TIMEOUT_SEC", "20"))
+OPENAI_REASONING_EFFORT = os.getenv("OPENAI_REASONING_EFFORT", "low")
+REVIEW_TRANSLATION = os.getenv("REVIEW_TRANSLATION", "1") == "1"
+CONSISTENCY_WINDOW_SEC = int(os.getenv("CONSISTENCY_WINDOW_SEC", "300"))
+
+# 자연스러운 대화 번역을 위해 최근 문맥 2개만 참고한다.
+# 문맥은 '참고용'이며 절대 다시 번역하지 않는다.
+USE_TRANSLATION_CONTEXT = os.getenv("USE_TRANSLATION_CONTEXT", "1") == "1"
+CONTEXT_MAXLEN = max(0, min(3, int(os.getenv("TRANSLATION_CONTEXT_MESSAGES", "2"))))
+
+# 예전 캐시/문맥과 섞이지 않도록 버전 갱신.
+STATE_VERSION = "v6_native_meaning_translation"
+CACHE_VERSION = "v6_native_meaning_translation"
+
+if not (LINE_CHANNEL_ACCESS_TOKEN and LINE_CHANNEL_SECRET and OPENAI_API_KEY):
+    print("[FATAL] Missing environment variables.", file=sys.stderr)
+    sys.exit(1)
+
+# ===== Persistent state path =====
+STATE_DIR = os.getenv("TRANSLATOR_STATE_DIR", "/opt/render/persistent/translator_state")
+STATE_FILE = "state.json"
+STATE_PATH = os.path.join(STATE_DIR, STATE_FILE)
+
+
+def _ensure_state_dir() -> str:
+    for p in [STATE_DIR, "/opt/render/persistent/translator_state", "./translator_state"]:
+        try:
+            os.makedirs(p, exist_ok=True)
+            tf = os.path.join(p, ".touch")
+            with open(tf, "w", encoding="utf-8") as f:
+                f.write("ok")
+            os.remove(tf)
+            return p
         except Exception as e:
-            print("[OpenAI RETRY ERROR]", repr(e), file=sys.stderr)
-
-    # 뒤에서부터 정상 후보를 고른다. 잘못된 재시도 결과가 정상 1차 결과를 덮지 않게 한다.
-    out = ""
-    for candidate in reversed(candidates):
-        if not _needs_retry(src, tgt, text, candidate):
-            out = candidate
-            break
-
-    if not out:
-        # 중요: 예전처럼 `return text`를 하지 않는다.
-        # 그 방식 때문에 태국어 입력이 태국어 그대로 사용자에게 출력되었다.
-        return _failure_message(tgt)
-
-    out = _restore_missing_emojis(text, out.strip())
-
-    # 의미 전달 검수: 원문과 초안을 함께 보고 누락/반대 의미/관계어/말투를 교정한다.
-    out = _review_translation(ctx, text, src, tgt, out)
-    out = _restore_missing_emojis(text, out.strip())
-
-    # 검수 결과까지 마지막으로 안전 검사한다.
-    if _needs_retry(src, tgt, text, out):
-        return _failure_message(tgt)
-
-    # 정상 번역만 캐시 및 대화 문맥에 저장한다.
-    _cache_put(slot, key, out)
-    _push_context(slot, src, tgt, text, out)
-    return out
+            print(f"[WARN] state dir '{p}' not usable: {e}", file=sys.stderr)
+            continue
+    return "./translator_state"
 
 
-# ===== routes =====
-@app.route("/", methods=["GET"])
-def home():
-    return "OK", 200
+STATE_DIR = _ensure_state_dir()
+STATE_PATH = os.path.join(STATE_DIR, STATE_FILE)
+print(f"[STATE] Using state dir: {STATE_DIR}")
+
+# ===== Clients =====
+line_config = Configuration(access_token=LINE_CHANNEL_ACCESS_TOKEN)
+handler = WebhookHandler(LINE_CHANNEL_SECRET)
+oai = OpenAI(api_key=OPENAI_API_KEY)
+
+# ===== In-memory state =====
+_state_mem: Dict[str, Any] = {}
+_loaded = False
+_last_flush = 0.0
 
 
-@app.route("/callback", methods=["POST"])
-def callback():
-    signature = request.headers.get("X-Line-Signature", "")
-    body = request.get_data(as_text=True)
-    app.logger.info("[EVENT IN] %s", body)
-    try:
-        handler.handle(body, signature)
-    except Exception as e:
-        print("[Webhook ERROR]", repr(e), file=sys.stderr)
-        abort(400)
-    return "OK", 200
-
-
-# ===== handler =====
-@handler.add(MessageEvent, message=TextMessageContent)
-def on_message(event: MessageEvent):
-    _load_state()
-
-    slot = _room_key(event)
-    text = (event.message.text or "").strip()
-    app.logger.info("[MESSAGE] %s | %s", slot, text)
-
-    if not text:
-        _reply(event.reply_token, text)
+def _load_state():
+    global _state_mem, _loaded, _last_flush
+    if _loaded:
         return
-
-    # 오역 문맥이 쌓였다고 느낄 때 LINE에서 /reset 입력하면 즉시 초기화.
-    if text.lower() in {"/reset", "/clear", "번역초기화", "문맥초기화"}:
-        _clear_room_context(slot)
-        _reply(event.reply_token, "번역 문맥을 초기화했어요.")
-        return
-
-    detected = detect_lang(text, _get_last_lang(slot))
-
-    # 이모지/리액션/숫자/기호/영어만 입력하면 그대로 출력
-    if detected in {"echo", "en"} or detected is None:
-        _reply(event.reply_token, text)
-        return
-
-    if detected == "ko":
-        src, tgt = "ko", "th"
-    elif detected == "th":
-        src, tgt = "th", "ko"
-    else:
-        _reply(event.reply_token, text)
-        return
-
-    out = translate(slot, text, src, tgt)
-    label = "🇰🇷→🇹🇭" if src == "ko" else "🇹🇭→🇰🇷"
-    _reply(event.reply_token, f"{label}\n{out}")
-
-    try:
-        _set_last_lang(slot, src)
-    except Exception as e:
-        print("[STATE] set last_lang failed:", repr(e), file=sys.stderr)
-
-
-def _reply(reply_token: str, text: str):
-    try:
-        with ApiClient(line_config) as api_client:
-            MessagingApi(api_client).reply_message(
-                ReplyMessageRequest(
-                    reply_token=reply_token,
-                    messages=[TextMessage(text=text)],
-                )
-            )
-    except Exception as e:
-        print("[LINE Reply ERROR]", repr(e), file=sys.stderr)
-
-
-# ===== main =====
-if __name__ == "__main__":
-    port = int(os.getenv("PORT", "10000"))
-    app.run(host="0.0.0.0", port=port)
