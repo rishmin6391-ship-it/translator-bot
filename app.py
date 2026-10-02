@@ -32,19 +32,19 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 # 의도적으로 사용하지 않는다. 이전 배포에서 잘못된/구형 모델명이 남아 있어도
 # 새 코드의 모델 선택을 덮어쓰지 못하게 하기 위함이다.
 # 필요할 때만 KIRA_* 변수로 새 모델을 지정한다.
-KIRA_PRIMARY_MODEL = os.getenv("KIRA_PRIMARY_MODEL", "gpt-6-luna")
+KIRA_PRIMARY_MODEL = os.getenv("KIRA_PRIMARY_MODEL", "gpt-5.6-luna")
 KIRA_FALLBACK_MODEL = os.getenv("KIRA_FALLBACK_MODEL", "gpt-4.1-mini")
 KIRA_EMERGENCY_MODEL = os.getenv("KIRA_EMERGENCY_MODEL", "gpt-4o-mini")
 KIRA_REVIEW_MODEL = os.getenv("KIRA_REVIEW_MODEL", KIRA_FALLBACK_MODEL)
 
 # LINE reply_token이 오래 기다리다 만료되지 않도록 단계별 timeout을 짧게 둔다.
 # 정상 상황에서는 1차 호출 한 번만 실행되므로 속도 저하는 없다.
-OPENAI_TIMEOUT_SEC = float(os.getenv("OPENAI_TIMEOUT_SEC", "6"))
-OPENAI_RETRY_TIMEOUT_SEC = float(os.getenv("OPENAI_RETRY_TIMEOUT_SEC", "6"))
-OPENAI_EMERGENCY_TIMEOUT_SEC = float(os.getenv("OPENAI_EMERGENCY_TIMEOUT_SEC", "5"))
+OPENAI_TIMEOUT_SEC = float(os.getenv("OPENAI_TIMEOUT_SEC", "5"))
+OPENAI_RETRY_TIMEOUT_SEC = float(os.getenv("OPENAI_RETRY_TIMEOUT_SEC", "4"))
+OPENAI_EMERGENCY_TIMEOUT_SEC = float(os.getenv("OPENAI_EMERGENCY_TIMEOUT_SEC", "3.5"))
 
 REVIEW_TRANSLATION = os.getenv("REVIEW_TRANSLATION", "0") == "1"
-OPENAI_MAX_OUTPUT_TOKENS = int(os.getenv("OPENAI_MAX_OUTPUT_TOKENS", "400"))
+OPENAI_MAX_OUTPUT_TOKENS = int(os.getenv("OPENAI_MAX_OUTPUT_TOKENS", "220"))
 CONSISTENCY_WINDOW_SEC = int(os.getenv("CONSISTENCY_WINDOW_SEC", "300"))
 
 # 자연스러운 대화 번역을 위해 최근 문맥 2개만 참고한다.
@@ -53,8 +53,8 @@ USE_TRANSLATION_CONTEXT = os.getenv("USE_TRANSLATION_CONTEXT", "1") == "1"
 CONTEXT_MAXLEN = max(0, min(3, int(os.getenv("TRANSLATION_CONTEXT_MESSAGES", "2"))))
 
 # 예전 캐시/문맥과 섞이지 않도록 버전 갱신.
-STATE_VERSION = "v9_model_safe_translation"
-CACHE_VERSION = "v9_model_safe_translation"
+STATE_VERSION = "v10_fast_translation"
+CACHE_VERSION = "v10_fast_translation"
 
 if not (LINE_CHANNEL_ACCESS_TOKEN and LINE_CHANNEL_SECRET and OPENAI_API_KEY):
     print("[FATAL] Missing environment variables.", file=sys.stderr)
@@ -499,14 +499,30 @@ def _responses_once(
     model: str,
     timeout: float = OPENAI_TIMEOUT_SEC,
 ) -> str:
-    """Responses API를 단순한 텍스트 번역 호출로 사용한다."""
-    resp = oai.responses.create(
-        model=model,
-        instructions=instructions,
-        input=payload,
-        max_output_tokens=OPENAI_MAX_OUTPUT_TOKENS,
-        timeout=timeout,
-    )
+    """Responses API를 번역에 최적화해서 호출한다. 추론형 모델은 reasoning=none으로 지연을 줄인다."""
+    kwargs: Dict[str, Any] = {
+        "model": model,
+        "instructions": instructions,
+        "input": payload,
+        "max_output_tokens": OPENAI_MAX_OUTPUT_TOKENS,
+        "timeout": timeout,
+    }
+
+    # 번역에는 긴 추론이 필요하지 않으므로 지연을 줄인다.
+    if model.startswith(("gpt-5.6", "gpt-6")):
+        kwargs["reasoning"] = {"effort": "none"}
+
+    started = time.perf_counter()
+    try:
+        resp = oai.responses.create(**kwargs)
+    except TypeError:
+        # 아주 오래된 SDK가 reasoning 인자를 모르면 제거 후 1회 재호출.
+        kwargs.pop("reasoning", None)
+        resp = oai.responses.create(**kwargs)
+    finally:
+        elapsed = time.perf_counter() - started
+        print(f"[OPENAI LATENCY] model={model} elapsed={elapsed:.2f}s", file=sys.stderr)
+
     return _extract_responses_text(resp)
 
 
@@ -856,7 +872,7 @@ def translate(slot: str, text: str, src: str, tgt: str) -> str:
 # ===== routes =====
 @app.route("/", methods=["GET"])
 def home():
-    return "Kira Translator v9 OK", 200
+    return "Kira Translator v10 FAST OK", 200
 
 
 @app.route("/health", methods=["GET"])
@@ -865,8 +881,12 @@ def health():
         "status": "ok",
         "version": STATE_VERSION,
         "primary_model": KIRA_PRIMARY_MODEL,
+        "primary_reasoning": "none",
+        "primary_timeout_sec": OPENAI_TIMEOUT_SEC,
         "fallback_model": KIRA_FALLBACK_MODEL,
+        "fallback_timeout_sec": OPENAI_RETRY_TIMEOUT_SEC,
         "emergency_model": KIRA_EMERGENCY_MODEL,
+        "emergency_timeout_sec": OPENAI_EMERGENCY_TIMEOUT_SEC,
     }, 200
 
 
