@@ -37,8 +37,9 @@ OPENAI_REVIEW_MODEL = os.getenv("OPENAI_REVIEW_MODEL", "gpt-5.6-sol")
 OPENAI_COMPAT_MODEL = os.getenv("OPENAI_COMPAT_MODEL", "gpt-4o")
 
 OPENAI_TIMEOUT_SEC = float(os.getenv("OPENAI_TIMEOUT_SEC", "20"))
-OPENAI_REASONING_EFFORT = os.getenv("OPENAI_REASONING_EFFORT", "low")
-REVIEW_TRANSLATION = os.getenv("REVIEW_TRANSLATION", "1") == "1"
+OPENAI_REASONING_EFFORT = os.getenv("OPENAI_REASONING_EFFORT", "none")
+REVIEW_TRANSLATION = os.getenv("REVIEW_TRANSLATION", "0") == "1"
+OPENAI_MAX_OUTPUT_TOKENS = int(os.getenv("OPENAI_MAX_OUTPUT_TOKENS", "400"))
 CONSISTENCY_WINDOW_SEC = int(os.getenv("CONSISTENCY_WINDOW_SEC", "300"))
 
 # 자연스러운 대화 번역을 위해 최근 문맥 2개만 참고한다.
@@ -47,8 +48,8 @@ USE_TRANSLATION_CONTEXT = os.getenv("USE_TRANSLATION_CONTEXT", "1") == "1"
 CONTEXT_MAXLEN = max(0, min(3, int(os.getenv("TRANSLATION_CONTEXT_MESSAGES", "2"))))
 
 # 예전 캐시/문맥과 섞이지 않도록 버전 갱신.
-STATE_VERSION = "v6_native_meaning_translation"
-CACHE_VERSION = "v6_native_meaning_translation"
+STATE_VERSION = "v7_fast_robust_translation"
+CACHE_VERSION = "v7_fast_robust_translation"
 
 if not (LINE_CHANNEL_ACCESS_TOKEN and LINE_CHANNEL_SECRET and OPENAI_API_KEY):
     print("[FATAL] Missing environment variables.", file=sys.stderr)
@@ -476,7 +477,7 @@ def _responses_once(
         "model": model,
         "instructions": instructions,
         "input": payload,
-        "max_output_tokens": 1200,
+        "max_output_tokens": OPENAI_MAX_OUTPUT_TOKENS,
         "timeout": timeout,
     }
 
@@ -587,7 +588,52 @@ def _restore_missing_emojis(inp: str, out: str) -> str:
     return fixed
 
 
+def _strip_source_echo(inp: str, out: str) -> str:
+    """모델이 번역문 뒤에 원문을 괄호/따옴표로 덧붙인 경우 원문 부분만 제거한다."""
+    src = inp.strip()
+    s = out.strip()
+    if not src or not s or src not in s or s == src:
+        return s
+
+    esc = re.escape(src)
+    wrappers = [
+        rf"\s*[\(（\[【\{{「『\"“']\s*{esc}\s*[\)）\]】\}}」』\"”']\s*",
+        rf"(?:^|\s){esc}(?:$|\s)",
+    ]
+    for pat in wrappers:
+        s = re.sub(pat, " ", s).strip()
+
+    s = re.sub(r"[ \t]{2,}", " ", s)
+    s = re.sub(r"\n{3,}", "\n\n", s)
+    return s.strip(" -–—:：|\n\t")
+
+
+def _clean_translation_candidate(inp: str, out: str) -> str:
+    """검증 전에 흔한 메타 라벨과 원문 재출력을 제거한다."""
+    s = (out or "").strip()
+    if not s:
+        return ""
+
+    # 모델이 실수로 붙인 번역 라벨 제거
+    s = re.sub(
+        r"^(?:translation|translated text|thai translation|korean translation|번역|번역문|คำแปล)\s*[:：]\s*",
+        "",
+        s,
+        flags=re.IGNORECASE,
+    ).strip()
+    return _strip_source_echo(inp, s)
+
+
+def _has_target_script(tgt: str, out: str) -> bool:
+    if tgt == "ko":
+        return bool(RE_HANGUL.search(out))
+    if tgt == "th":
+        return bool(RE_THAI.search(out))
+    return bool(out.strip())
+
+
 def _needs_retry(src: str, tgt: str, inp: str, out: str) -> bool:
+    out = _clean_translation_candidate(inp, out)
     if not out.strip():
         return True
     if _same_as_source(inp, out):
@@ -629,6 +675,7 @@ def _review_translation(
             payload,
             OPENAI_REVIEW_MODEL,
         ).strip()
+        reviewed = _clean_translation_candidate(text, reviewed)
         if reviewed and not _needs_retry(src, tgt, text, reviewed):
             return reviewed
     except Exception as e:
@@ -657,6 +704,7 @@ def translate(slot: str, text: str, src: str, tgt: str) -> str:
     # 1차 번역
     try:
         first = _translate_once(system_prompt(src, tgt), payload, OPENAI_MODEL).strip()
+        first = _clean_translation_candidate(text, first)
         if first:
             candidates.append(first)
     except Exception as e:
@@ -670,6 +718,7 @@ def translate(slot: str, text: str, src: str, tgt: str) -> str:
                 payload,
                 OPENAI_RETRY_MODEL,
             ).strip()
+            retry = _clean_translation_candidate(text, retry)
             if retry:
                 candidates.append(retry)
         except Exception as e:
@@ -678,13 +727,25 @@ def translate(slot: str, text: str, src: str, tgt: str) -> str:
     # 뒤에서부터 정상 후보를 고른다. 잘못된 재시도 결과가 정상 1차 결과를 덮지 않게 한다.
     out = ""
     for candidate in reversed(candidates):
+        candidate = _clean_translation_candidate(text, candidate)
         if not _needs_retry(src, tgt, text, candidate):
             out = candidate
             break
 
     if not out:
-        # 중요: 예전처럼 `return text`를 하지 않는다.
-        # 그 방식 때문에 태국어 입력이 태국어 그대로 사용자에게 출력되었다.
+        # 엄격 검증에 걸렸더라도, 원문과 다르고 목표 언어가 실제로 들어 있는 후보는
+        # 마지막 안전 후보로 사용한다. 짧은 정상 문장을 과도하게 실패 처리하는 것을 막는다.
+        for candidate in reversed(candidates):
+            candidate = _clean_translation_candidate(text, candidate)
+            if (
+                candidate
+                and not _same_as_source(text, candidate)
+                and _has_target_script(tgt, candidate)
+            ):
+                out = candidate
+                break
+
+    if not out:
         return _failure_message(tgt)
 
     out = _restore_missing_emojis(text, out.strip())
