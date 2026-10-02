@@ -1,192 +1,96 @@
-    else:
-        return "Return payload.current as-is."
+import os
+import re
+import sys
+import json
+import time
+import hashlib
+from typing import Optional, Dict, Any, List
 
-    if correction:
-        p += (
-            "\n\nCORRECTION PASS: Translate from the ORIGINAL payload.current again. "
-            "Do not copy the previous bad output. Be extra strict about target language, "
-            "complete meaning, actor/object, negation, relationship terms, numbers, and tone."
-        )
-    return p
+from flask import Flask, request, abort
 
-
-def review_prompt(src: str, tgt: str) -> str:
-    if (src, tgt) == ("ko", "th"):
-        return REVIEW_RULES + "\n\n" + KO_TO_TH_RULES
-    if (src, tgt) == ("th", "ko"):
-        return REVIEW_RULES + "\n\n" + TH_TO_KO_RULES
-    return REVIEW_RULES
-
-
-def _build_payload(ctx: List[Dict[str, str]], current: str) -> str:
-    return json.dumps(
-        {
-            "context": ctx,
-            "current": current,
-        },
-        ensure_ascii=False,
-        separators=(",", ":"),
-    )
-
-
-def _build_review_payload(
-    ctx: List[Dict[str, str]],
-    current: str,
-    draft: str,
-    src: str,
-    tgt: str,
-) -> str:
-    return json.dumps(
-        {
-            "source_language": src,
-            "target_language": tgt,
-            "context": ctx,
-            "current": current,
-            "draft": draft,
-        },
-        ensure_ascii=False,
-        separators=(",", ":"),
-    )
-
-
-def _responses_once(
-    instructions: str,
-    payload: str,
-    model: str,
-    timeout: float = OPENAI_TIMEOUT_SEC,
-) -> str:
-    """최신 SDK의 Responses API 사용. 추론을 끄고 번역만 빠르게 수행."""
-    kwargs: Dict[str, Any] = {
-        "model": model,
-        "instructions": instructions,
-        "input": payload,
-        "max_output_tokens": 1200,
-        "timeout": timeout,
-    }
-
-    # 번역은 긴 추론이 필요하지 않지만, low 정도를 주면 의미 보존이 더 안정적이다.
-    if model.startswith(("gpt-5", "gpt-6")):
-        kwargs["reasoning"] = {"effort": OPENAI_REASONING_EFFORT}
-
-    try:
-        resp = oai.responses.create(**kwargs)
-    except TypeError:
-        # 일부 구버전 SDK가 reasoning 인자를 모를 수 있으므로 한 번만 제거 후 호환 시도.
-        kwargs.pop("reasoning", None)
-        resp = oai.responses.create(**kwargs)
-    return (getattr(resp, "output_text", "") or "").strip()
-
-
-def _chat_compat_once(
-    instructions: str,
-    payload: str,
-    model: str,
-    timeout: float = OPENAI_TIMEOUT_SEC,
-) -> str:
-    """구버전 OpenAI SDK 호환용 fallback."""
-    resp = oai.chat.completions.create(
-        model=model,
-        messages=[
-            {"role": "system", "content": instructions},
-            {"role": "user", "content": payload},
-        ],
-        timeout=timeout,
-    )
-    return (resp.choices[0].message.content or "").strip()
-
-
-def _translate_once(
-    instructions: str,
-    payload: str,
-    model: str,
-    timeout: float = OPENAI_TIMEOUT_SEC,
-) -> str:
-    # 최신 SDK에서는 Responses API. 아주 오래된 SDK라 responses가 없으면 기존 Chat API로 동작.
-    if hasattr(oai, "responses"):
-        return _responses_once(instructions, payload, model, timeout)
-    return _chat_compat_once(instructions, payload, OPENAI_COMPAT_MODEL, timeout)
-
-
-def _has_wrong_script(tgt: str, out: str) -> bool:
-    # 일반 문장 번역 결과에는 원문 언어 문자가 남아 있으면 안 된다.
-    if tgt == "th" and RE_HANGUL.search(out):
-        return True
-    if tgt == "ko" and RE_THAI.search(out):
-        return True
-    return False
-
-
-def _has_wrong_speaker_gender(src: str, tgt: str, out: str) -> bool:
-    if (src, tgt) == ("ko", "th") and THAI_FEMALE_SPEAKER_RE.search(out):
-        return True
-    return False
-
-
-def _looks_like_meta_answer(out: str) -> bool:
-    s = out.strip().lower()
-    prefixes = (
-        "translation:",
-        "translated text:",
-        "thai translation:",
-        "korean translation:",
-        "번역:",
-        "번역문:",
-        "คำแปล:",
-    )
-    return any(s.startswith(p) for p in prefixes)
-
-
-def _normalized_for_compare(text: str) -> str:
-    return re.sub(r"\s+", "", text).strip().lower()
-
-
-def _same_as_source(inp: str, out: str) -> bool:
-    a = _normalized_for_compare(inp)
-    b = _normalized_for_compare(out)
-    return bool(a and a == b)
-
-
-PROTECTED_TOKEN_RE = re.compile(
-    r"https?://\S+|www\.\S+|@[A-Za-z0-9_.$-]+|"
-    r"\d+(?:[.,:/-]\d+)*"
+# ===== LINE v3 SDK =====
+from linebot.v3.webhooks import MessageEvent, TextMessageContent
+from linebot.v3.webhook import WebhookHandler
+from linebot.v3.messaging import (
+    Configuration, ApiClient, MessagingApi,
+    ReplyMessageRequest, TextMessage
 )
 
+# ===== OpenAI =====
+from openai import OpenAI
 
-def _missing_protected_token(inp: str, out: str) -> bool:
-    """숫자/시간/가격/URL/@mention이 번역 중 사라졌는지 검사."""
-    tokens = PROTECTED_TOKEN_RE.findall(inp)
-    return any(token not in out for token in tokens)
+app = Flask(__name__)
+
+# ===== ENV =====
+LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN")
+LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+
+# 번역 품질 우선 설정.
+# - 1차 번역: gpt-5.6-terra (속도/비용 균형)
+# - 재번역/의미 검수: gpt-5.6-sol (정확도 우선)
+# 비용을 줄이려면 Render 환경변수에서 REVIEW_TRANSLATION=0 으로 끌 수 있다.
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5.6-terra")
+OPENAI_RETRY_MODEL = os.getenv("OPENAI_RETRY_MODEL", "gpt-5.6-sol")
+OPENAI_REVIEW_MODEL = os.getenv("OPENAI_REVIEW_MODEL", "gpt-5.6-sol")
+# 아주 오래된 OpenAI SDK에서 Responses API가 없을 때만 사용하는 호환 모델.
+OPENAI_COMPAT_MODEL = os.getenv("OPENAI_COMPAT_MODEL", "gpt-4o")
+
+OPENAI_TIMEOUT_SEC = float(os.getenv("OPENAI_TIMEOUT_SEC", "20"))
+OPENAI_REASONING_EFFORT = os.getenv("OPENAI_REASONING_EFFORT", "low")
+REVIEW_TRANSLATION = os.getenv("REVIEW_TRANSLATION", "1") == "1"
+CONSISTENCY_WINDOW_SEC = int(os.getenv("CONSISTENCY_WINDOW_SEC", "300"))
+
+# 자연스러운 대화 번역을 위해 최근 문맥 2개만 참고한다.
+# 문맥은 '참고용'이며 절대 다시 번역하지 않는다.
+USE_TRANSLATION_CONTEXT = os.getenv("USE_TRANSLATION_CONTEXT", "1") == "1"
+CONTEXT_MAXLEN = max(0, min(3, int(os.getenv("TRANSLATION_CONTEXT_MESSAGES", "2"))))
+
+# 예전 캐시/문맥과 섞이지 않도록 버전 갱신.
+STATE_VERSION = "v6_native_meaning_translation"
+CACHE_VERSION = "v6_native_meaning_translation"
+
+if not (LINE_CHANNEL_ACCESS_TOKEN and LINE_CHANNEL_SECRET and OPENAI_API_KEY):
+    print("[FATAL] Missing environment variables.", file=sys.stderr)
+    sys.exit(1)
+
+# ===== Persistent state path =====
+STATE_DIR = os.getenv("TRANSLATOR_STATE_DIR", "/opt/render/persistent/translator_state")
+STATE_FILE = "state.json"
+STATE_PATH = os.path.join(STATE_DIR, STATE_FILE)
 
 
-def _restore_missing_emojis(inp: str, out: str) -> str:
-    """모델이 이모지를 빠뜨렸을 때 누락분만 끝에 복원."""
-    in_emojis = EMOJI_REGEX.findall(inp)
-    if not in_emojis:
-        return out
+def _ensure_state_dir() -> str:
+    for p in [STATE_DIR, "/opt/render/persistent/translator_state", "./translator_state"]:
+        try:
+            os.makedirs(p, exist_ok=True)
+            tf = os.path.join(p, ".touch")
+            with open(tf, "w", encoding="utf-8") as f:
+                f.write("ok")
+            os.remove(tf)
+            return p
+        except Exception as e:
+            print(f"[WARN] state dir '{p}' not usable: {e}", file=sys.stderr)
+            continue
+    return "./translator_state"
 
-    fixed = out
-    for emoji in in_emojis:
-        if emoji not in fixed:
-            fixed += emoji
-    return fixed
+
+STATE_DIR = _ensure_state_dir()
+STATE_PATH = os.path.join(STATE_DIR, STATE_FILE)
+print(f"[STATE] Using state dir: {STATE_DIR}")
+
+# ===== Clients =====
+line_config = Configuration(access_token=LINE_CHANNEL_ACCESS_TOKEN)
+handler = WebhookHandler(LINE_CHANNEL_SECRET)
+oai = OpenAI(api_key=OPENAI_API_KEY)
+
+# ===== In-memory state =====
+_state_mem: Dict[str, Any] = {}
+_loaded = False
+_last_flush = 0.0
 
 
-def _needs_retry(src: str, tgt: str, inp: str, out: str) -> bool:
-    if not out.strip():
-        return True
-    if _same_as_source(inp, out):
-        return True
-    if _has_wrong_script(tgt, out):
-        return True
-    if _has_wrong_speaker_gender(src, tgt, out):
-        return True
-    if _looks_like_meta_answer(out):
-        return True
-    if _missing_protected_token(inp, out):
-        return True
-
-    li, lo = len(inp.strip()), len(out.strip())
-    if li >= 20 and lo < 2:
-        return True
-    # 예전의 `lo > 250` 검사는 정상적인 긴 번역도 오류로 처리했다.
-    # 입력 길이에 비해 비정상적으로 길어진 경우만 재시도한다.
+def _load_state():
+    global _state_mem, _loaded, _last_flush
+    if _loaded:
+        return
