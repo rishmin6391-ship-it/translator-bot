@@ -35,6 +35,7 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 KIRA_PRIMARY_MODEL = os.getenv("KIRA_PRIMARY_MODEL", "gpt-5.6-luna")
 KIRA_FALLBACK_MODEL = os.getenv("KIRA_FALLBACK_MODEL", "gpt-4.1-mini")
 KIRA_EMERGENCY_MODEL = os.getenv("KIRA_EMERGENCY_MODEL", "gpt-4o-mini")
+KIRA_LAST_RESORT_MODEL = os.getenv("KIRA_LAST_RESORT_MODEL", KIRA_EMERGENCY_MODEL)
 KIRA_REVIEW_MODEL = os.getenv("KIRA_REVIEW_MODEL", KIRA_FALLBACK_MODEL)
 
 # LINE reply_token이 오래 기다리다 만료되지 않도록 단계별 timeout을 짧게 둔다.
@@ -53,8 +54,8 @@ USE_TRANSLATION_CONTEXT = os.getenv("USE_TRANSLATION_CONTEXT", "1") == "1"
 CONTEXT_MAXLEN = max(0, min(3, int(os.getenv("TRANSLATION_CONTEXT_MESSAGES", "2"))))
 
 # 예전 캐시/문맥과 섞이지 않도록 버전 갱신.
-STATE_VERSION = "v10_fast_translation"
-CACHE_VERSION = "v10_fast_translation"
+STATE_VERSION = "v11_best_effort_translation"
+CACHE_VERSION = "v11_best_effort_translation"
 
 if not (LINE_CHANNEL_ACCESS_TOKEN and LINE_CHANNEL_SECRET and OPENAI_API_KEY):
     print("[FATAL] Missing environment variables.", file=sys.stderr)
@@ -443,6 +444,47 @@ def review_prompt(src: str, tgt: str) -> str:
     return REVIEW_RULES
 
 
+
+
+MINIMAL_TRANSLATE_TEMPLATE = """You are a Korean↔Thai chat translator. Translate the single user message from {src_name} to {tgt_name}. Output ONLY the translation in {tgt_name}. No explanations, no labels, no quotes."""
+
+
+def _minimal_translate_prompt(src: str, tgt: str) -> str:
+    src_name = "Korean" if src == "ko" else "Thai"
+    tgt_name = "Thai" if tgt == "th" else "Korean"
+    return MINIMAL_TRANSLATE_TEMPLATE.format(src_name=src_name, tgt_name=tgt_name)
+
+
+def _best_effort_candidate(src: str, tgt: str, inp: str, out: str) -> bool:
+    """사용자에게 실패 문구를 보여주기보다, 최소한 쓸 수 있는 번역 후보인지 느슨하게 판단."""
+    out = _clean_translation_candidate(inp, out)
+    if not out:
+        return False
+    if _same_as_source(inp, out):
+        return False
+    if _has_wrong_script(tgt, out):
+        return False
+    if _has_wrong_speaker_gender(src, tgt, out):
+        return False
+    # 메타 라벨/설명은 원칙적으로 제거되므로 여기서는 허용하지 않음
+    if _looks_like_meta_answer(out):
+        return False
+    return True
+
+
+def _last_resort_translate(text: str, src: str, tgt: str) -> str:
+    """문맥 없이 아주 짧은 프롬프트로 마지막 한 번 더 시도."""
+    try:
+        return _chat_compat_once(
+            _minimal_translate_prompt(src, tgt),
+            text,
+            KIRA_LAST_RESORT_MODEL,
+            OPENAI_EMERGENCY_TIMEOUT_SEC,
+        ).strip()
+    except Exception as e:
+        print("[OpenAI LAST RESORT ERROR]", repr(e), file=sys.stderr)
+        return ""
+
 def _build_payload(ctx: List[Dict[str, str]], current: str) -> str:
     return json.dumps(
         {
@@ -808,8 +850,7 @@ def translate(slot: str, text: str, src: str, tgt: str) -> str:
         except Exception as e:
             print("[OpenAI RETRY ERROR]", repr(e), file=sys.stderr)
 
-    # 3) 앞의 두 경로가 모두 실패/비정상이면 Chat Completions + 호환 모델로 마지막 우회.
-    #    서로 다른 API 경로를 사용하므로 일시적인 Responses 오류에도 더 강하다.
+    # 3) 앞의 두 경로가 모두 실패/비정상이면 Chat Completions 경로로 우회
     has_strict_valid = any(
         not _needs_retry(src, tgt, text, c)
         for c in candidates
@@ -828,7 +869,14 @@ def translate(slot: str, text: str, src: str, tgt: str) -> str:
         except Exception as e:
             print("[OpenAI EMERGENCY ERROR]", repr(e), file=sys.stderr)
 
-    # 가장 최근의 정상 후보를 우선 선택한다.
+    # 4) 그래도 실패하면 문맥 없이 아주 단순한 프롬프트로 마지막 한 번
+    if not any(_best_effort_candidate(src, tgt, text, c) for c in candidates if c):
+        rescue = _last_resort_translate(text, src, tgt)
+        rescue = _clean_translation_candidate(text, rescue)
+        if rescue:
+            candidates.append(rescue)
+
+    # A. 가장 최근의 엄격 정상 후보를 우선 선택
     out = ""
     for candidate in reversed(candidates):
         candidate = _clean_translation_candidate(text, candidate)
@@ -836,8 +884,7 @@ def translate(slot: str, text: str, src: str, tgt: str) -> str:
             out = candidate
             break
 
-    # 엄격 휴리스틱만 걸린 경우에도 실제로 안전한 번역이면 사용한다.
-    # 단, 숫자/시간/URL 누락 등 의미 손실 위험이 있으면 절대 통과시키지 않는다.
+    # B. 엄격 검증엔 걸려도 실제 사용 가능한 후보면 채택
     if not out:
         for candidate in reversed(candidates):
             candidate = _clean_translation_candidate(text, candidate)
@@ -845,25 +892,27 @@ def translate(slot: str, text: str, src: str, tgt: str) -> str:
                 out = candidate
                 break
 
+    # C. 마지막으로 best-effort 후보를 채택해서 사용자-facing 실패 문구를 최대한 없앤다.
+    if not out:
+        for candidate in reversed(candidates):
+            candidate = _clean_translation_candidate(text, candidate)
+            if _best_effort_candidate(src, tgt, text, candidate):
+                out = candidate
+                break
+
+    # D. 정말 모든 모델 호출이 비었을 때만 실패 문구 사용
     if not out:
         return _failure_message(tgt)
 
     out = _restore_missing_emojis(text, out.strip())
-    pre_review = out
 
-    # 의미 전달 검수. 검수 API가 실패하더라도 이미 정상인 번역은 버리지 않는다.
-    reviewed = _review_translation(ctx, text, src, tgt, pre_review)
+    # 검수는 선택적. 검수 실패 시 기존 번역 유지
+    reviewed = _review_translation(ctx, text, src, tgt, out)
     reviewed = _restore_missing_emojis(text, reviewed.strip())
-
-    if not _needs_retry(src, tgt, text, reviewed):
+    if reviewed and _best_effort_candidate(src, tgt, text, reviewed):
         out = reviewed
-    elif _safe_relaxed_candidate(src, tgt, text, pre_review):
-        # 검수 결과가 오히려 비정상일 때는 정상 1차/재번역 결과로 되돌린다.
-        out = pre_review
-    else:
-        return _failure_message(tgt)
 
-    # 정상 번역만 캐시 및 대화 문맥에 저장한다.
+    # 최종 저장
     _cache_put(slot, key, out)
     _push_context(slot, src, tgt, text, out)
     return out
@@ -887,6 +936,7 @@ def health():
         "fallback_timeout_sec": OPENAI_RETRY_TIMEOUT_SEC,
         "emergency_model": KIRA_EMERGENCY_MODEL,
         "emergency_timeout_sec": OPENAI_EMERGENCY_TIMEOUT_SEC,
+        "last_resort_model": KIRA_LAST_RESORT_MODEL,
     }, 200
 
 
