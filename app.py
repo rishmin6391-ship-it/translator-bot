@@ -49,8 +49,8 @@ USE_TRANSLATION_CONTEXT = os.getenv("USE_TRANSLATION_CONTEXT", "1") == "1"
 CONTEXT_MAXLEN = max(0, min(3, int(os.getenv("TRANSLATION_CONTEXT_MESSAGES", "2"))))
 
 # 예전 캐시/문맥과 섞이지 않도록 버전 갱신.
-STATE_VERSION = "v12_accuracy_thai_chat"
-CACHE_VERSION = "v12_accuracy_thai_chat"
+STATE_VERSION = "v13_numeric_chat_fix"
+CACHE_VERSION = "v13_numeric_chat_fix"
 
 if not (LINE_CHANNEL_ACCESS_TOKEN and LINE_CHANNEL_SECRET and OPENAI_API_KEY):
     print("[FATAL] Missing environment variables.", file=sys.stderr)
@@ -363,7 +363,7 @@ STRICT RULES:
 3. If the source contains a typo or casual spelling, infer the most likely normal chat meaning instead of translating the typo literally.
 4. Context may resolve an omitted subject only when it is clear. If not clear, use a natural target sentence that also omits the subject.
 5. Match the source register: casual, affectionate, polite, annoyed, teasing, etc. Do not make it more formal than necessary.
-6. Preserve money, dates, times, URLs, @mentions, model/product names, and emojis.
+6. Preserve the MEANING of quantities, money, dates, times, URLs, @mentions, model/product names, and emojis. A plain count digit may be naturally verbalized in the target language (for example Thai 1 → Korean 하나/한 개) as long as the quantity stays the same. URLs and @mentions must remain literal.
 7. EXCEPTION: chat laughter is not a protected number. Thai 555/5555/55555 means laughter and should become natural Korean laughter such as ㅋㅋㅋ. Korean ㅋㅋ/ㅎㅎ may become natural Thai 555 when appropriate.
 8. Output ONLY the final translation. No labels, notes, source copy, romanization, alternatives, or explanations.
 9. Before output, silently compare source and translation clause-by-clause. Check actor, action, object, negation, time order, and tone. If the target contains any meaning not supported by the source, remove it.
@@ -407,6 +407,9 @@ Korean: 준비하고 있어요.
 
 Thai: ฉันชาร์จแบตไว้ในห้อง
 Korean: 방에 배터리 충전해 뒀어.
+
+Thai: มี1โต๊ะค่ะ ตอนนี้ 😂
+Korean: 지금은 테이블이 하나 있어요 😂
 """.strip()
 
 REVIEW_RULES = """
@@ -631,21 +634,31 @@ def _same_as_source(inp: str, out: str) -> bool:
     return bool(a and a == b)
 
 
-PROTECTED_TOKEN_RE = re.compile(
-    r"https?://\S+|www\.\S+|@[A-Za-z0-9_.$-]+|"
-    r"\d+(?:[.,:/-]\d+)*"
+PROTECTED_LITERAL_RE = re.compile(
+    r"https?://\S+|www\.\S+|@[A-Za-z0-9_.$-]+"
 )
 
 
 def _missing_protected_token(inp: str, out: str) -> bool:
-    """숫자/시간/가격/URL/@mention 보존. 단, 태국 채팅의 555... 웃음은 숫자로 취급하지 않는다."""
-    tokens = PROTECTED_TOKEN_RE.findall(inp)
-    for token in tokens:
-        if re.fullmatch(r"5{3,}", token):
-            continue
-        if token not in out:
-            return True
-    return False
+    """
+    하드 실패는 URL/@mention 같은 '문자 그대로 유지해야 하는 토큰'에만 적용한다.
+
+    예전 코드는 모든 숫자를 정확히 같은 문자열로 요구했다. 그래서 태국어
+    'มี1โต๊ะค่ะ ตอนนี้'를 모델이 자연스럽게 '지금은 테이블이 하나 있어요'라고
+    번역하면, 의미는 맞는데 결과에 문자 '1'이 없다는 이유만으로 실패 처리됐다.
+
+    일반 숫자/수량은 프롬프트에서 의미 보존을 강하게 요구하되, 1↔하나/한 개처럼
+    자연스러운 숫자 표현 변환은 허용한다. 이 함수 때문에 정상 번역을 버리지 않는다.
+    """
+    tokens = PROTECTED_LITERAL_RE.findall(inp)
+    return any(token not in out for token in tokens)
+
+
+def _numeric_change_warning(inp: str, out: str) -> None:
+    """숫자 표기가 바뀐 경우 로그만 남긴다. 번역 실패 조건으로 사용하지 않는다."""
+    src_nums = [n for n in re.findall(r"\d+(?:[.,:/-]\d+)*", inp) if not re.fullmatch(r"5{3,}", n)]
+    if src_nums and any(n not in out for n in src_nums):
+        print(f"[NUMBER FORMAT CHANGED] source={src_nums!r} out={out!r}", file=sys.stderr)
 
 
 def _restore_missing_emojis(inp: str, out: str) -> str:
@@ -829,6 +842,7 @@ def translate(slot: str, text: str, src: str, tgt: str) -> str:
     if not out:
         return _failure_message(tgt)
 
+    _numeric_change_warning(text, out)
     out = _postprocess_chat_style(src, tgt, text, out)
     out = _restore_missing_emojis(text, out.strip())
 
